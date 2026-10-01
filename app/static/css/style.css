@@ -1,0 +1,301 @@
+:root {
+  --bg: #0f1117;
+  --panel: #1a1d27;
+  --border: #2a2e3a;
+  --text: #e8e9ed;
+  --muted: #8a8f9c;
+  --accent: #5b8def;
+  --danger: #e35d5d;
+  --ok: #4caf7d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 18px; margin: 0; }
+main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+/* ---- Navigazione tra le sezioni ---- */
+header { position: sticky; top: 0; z-index: 20; background: var(--bg); flex-wrap: wrap; gap: 12px; }
+.brand { color: var(--text); text-decoration: none; }
+#main-nav { display: flex; gap: 4px; flex-wrap: wrap; }
+#main-nav a { color: var(--muted); text-decoration: none; padding: 8px 14px; border-radius: 8px; font-size: 14px;
+  border: 1px solid transparent; }
+#main-nav a:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+#main-nav a.active { color: var(--text); background: var(--panel); border-color: var(--border); }
+.view { display: none; flex-direction: column; gap: 24px; }
+.view.active { display: flex; }
+.view-home.active { display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; align-items: start; }
+.view-col { display: flex; flex-direction: column; gap: 24px; min-width: 0; }
+.view-intro { margin: 0; color: var(--muted); font-size: 14px; }
+@media (max-width: 900px) { .view-home.active { grid-template-columns: 1fr; } }
+
+/* ---- Tabelle (archivio firmware) ---- */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 8px 10px;
+  border-bottom: 1px solid var(--border); white-space: nowrap; background: rgba(255,255,255,0.02); }
+.data-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: rgba(255,255,255,0.02); }
+.data-table .fw-name { font-family: monospace; font-size: 12px; word-break: break-all; max-width: 260px; }
+.data-table .derived { font-style: italic; color: var(--muted); }
+.data-table .actions { white-space: nowrap; }
+.data-table .actions button, .data-table .actions a { margin-right: 4px; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin: 1px 2px 1px 0;
+  border: 1px solid var(--border); color: var(--text); white-space: nowrap; }
+.badge-accent { border-color: var(--accent); color: var(--accent); }
+.badge-ok { border-color: var(--ok); color: var(--ok); }
+.badge-muted { color: var(--muted); }
+.archive-toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.btn-small { padding: 3px 9px; font-size: 12px; }
+.device-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+section, .panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+.panel { padding: 0; overflow: hidden; } /* summary/panel-body gestiscono il proprio padding */
+.panel > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  font-weight: 600;
+  user-select: none;
+}
+.panel > summary::-webkit-details-marker { display: none; }
+.panel > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+.panel[open] > summary::before { transform: rotate(90deg); }
+.panel > summary:hover { background: rgba(255,255,255,0.03); }
+.panel-icon { font-size: 18px; line-height: 1; flex-shrink: 0; }
+.panel-title { flex: 1; }
+.panel-body { padding: 0 16px 16px; }
+#flash-panel, #wifi-devices { grid-column: span 1; }
+#flash-panel, #firmware-builder, #wifi-test-panel { grid-column: span 2; }
+.inline-row { display: flex; gap: 8px; }
+.inline-row select { flex: 1; }
+#flash-log,
+#build-log,
+#loader-build-log,
+#loader-full-build-log,
+#usb-bridge-log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  margin-top: 10px;
+  max-height: 300px;   /* ~15-20 righe a 12px: oltre, scrolla invece di allungare la pagina */
+  overflow-y: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  color: var(--muted);
+}
+.device-item-meta { font-size: 12px; color: var(--muted); }
+#install-button-container { margin-top: 10px; }
+esp-web-install-button { display: inline-block; }
+.hint { color: var(--muted); font-size: 13px; margin-top: -8px; }
+.widget-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.widget-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+}
+.widget-card h3 { font-size: 14px; margin: 0 0 4px; }
+.widget-card p { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+.page-list { list-style: none; padding: 0; margin: 0 0 16px; }
+.page-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+  cursor: grab;
+}
+.page-item.dragging { opacity: 0.4; }
+.btn-primary, .btn-secondary {
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-primary { background: var(--accent); color: white; }
+.btn-secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+.btn-remove { background: transparent; border: none; color: var(--danger); cursor: pointer; font-size: 16px; }
+.status-badge { font-size: 12px; padding: 4px 10px; border-radius: 12px; }
+.status-unknown { background: #333; color: var(--muted); }
+.status-ok { background: rgba(76,175,125,0.15); color: var(--ok); }
+.status-error { background: rgba(227,93,93,0.15); color: var(--danger); }
+#save-feedback { margin-left: 10px; font-size: 12px; color: var(--ok); }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; }
+.modal.hidden { display: none; }
+.modal-content { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: 360px; }
+.modal-content label { display: block; margin-bottom: 10px; font-size: 13px; }
+.modal-content input, .modal-content select, .modal-content textarea {
+  width: 100%; margin-top: 4px; padding: 6px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* ---- Modalità firmware / VPN ---- */
+.checkbox-label { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.checkbox-label input { width: auto; margin: 0; }
+.subsection-title { font-size: 14px; margin: 0 0 8px; }
+.loader-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin: 12px 0; }
+.loader-status .status-card { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font-size: 13px; }
+.loader-status .status-card strong { display: block; margin-bottom: 4px; }
+.loader-status .status-card span { color: var(--muted); display: block; }
+.peer-online { color: var(--ok); }
+.peer-offline { color: var(--muted); }
+
+/* ---- Configurazione display e microSD ---- */
+.devcfg-toolbar, .devcfg-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.devcfg-toolbar label { display: flex; gap: 6px; align-items: center; margin: 0; }
+.devcfg-file-btn { display: inline-block; }
+.devcfg-editor fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 10px 0; padding: 10px; }
+.devcfg-editor legend { padding: 0 6px; font-size: 13px; }
+.devcfg-editor fieldset > label:not(.checkbox-label) { display: block; margin: 6px 0; font-size: 13px; }
+.devcfg-editor fieldset > label input { display: block; width: 100%; }
+.devcfg-editor textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+.devcfg-item-actions { display: flex; gap: 4px; }
+.devcfg-item-actions button { padding: 4px 8px; }
+
+/* ---- Decodifica crash ---- */
+.crash-decoder { margin-top: 12px; }
+.crash-box summary { cursor: pointer; font-size: 13px; color: var(--accent); }
+.crash-input { width: 100%; font-family: monospace; font-size: 12px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; }
+.crash-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.crash-row select { flex: 1; min-width: 200px; }
+.crash-output { white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 420px; overflow: auto; }
+
+/* ---- Pagine attive: azioni e parametri ---- */
+.page-item-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.page-item-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.btn-move { background: transparent; border: 1px solid var(--border); color: var(--text); border-radius: 6px;
+  width: 30px; height: 30px; cursor: pointer; font-size: 13px; }
+.btn-move:disabled { opacity: 0.3; cursor: default; }
+.btn-move:not(:disabled):hover { border-color: var(--accent); color: var(--accent); }
+.multiselect { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.multiselect-option { display: flex; align-items: center; gap: 6px; font-weight: normal; }
+
+/* ---- Versioni ---- */
+.cl-editor { border: 1px solid var(--accent); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+.cl-editor.hidden { display: none; }
+.cl-editor h3 { margin: 0 0 10px; font-size: 15px; }
+.cl-editor label { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+.cl-editor input, .cl-editor textarea { width: 100%; margin-top: 4px; }
+.cl-editor textarea { font-family: monospace; font-size: 13px; }
+.cl-editor-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+.cl-entry { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; }
+.cl-entry.current { border-color: var(--accent); }
+.cl-entry-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.cl-entry-version { font-size: 16px; font-weight: 700; }
+.cl-entry-title { font-weight: 600; }
+.cl-entry-date { color: var(--muted); font-size: 12px; }
+.cl-entry-actions { margin-left: auto; display: flex; gap: 6px; }
+.cl-entry .doc-content { margin-top: 8px; }
+
+/* ---- Documentazione ---- */
+.docs-layout { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }
+.docs-nav { position: sticky; top: 80px; max-height: calc(100vh - 100px); overflow: auto; }
+.docs-group { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin: 12px 0 4px; }
+.docs-group:first-child { margin-top: 0; }
+.docs-link { display: block; padding: 6px 10px; border-radius: 6px; color: var(--text); text-decoration: none; font-size: 14px; }
+.docs-link:hover { background: rgba(255,255,255,0.04); }
+.docs-link.active { background: rgba(91,141,239,0.15); color: var(--accent); }
+.docs-toc { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 10px; font-size: 12px; }
+.docs-toc ul { list-style: none; padding-left: 10px; margin: 0; }
+.docs-toc > .toc > ul { padding-left: 0; }
+.docs-toc a { color: var(--muted); text-decoration: none; display: block; padding: 2px 0; }
+.docs-toc a:hover { color: var(--text); }
+.doc-content { line-height: 1.6; font-size: 14px; overflow-wrap: anywhere; }
+.doc-content h1 { font-size: 22px; margin-top: 0; }
+.doc-content h2 { font-size: 18px; margin-top: 28px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.doc-content h3 { font-size: 15px; margin-top: 20px; }
+.doc-content a { color: var(--accent); }
+.doc-content code { background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+.doc-content pre { background: #0b0d12; border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow-x: auto; }
+.doc-content pre code { background: none; padding: 0; }
+.doc-content table { border-collapse: collapse; margin: 12px 0; display: block; overflow-x: auto; }
+.doc-content th, .doc-content td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.doc-content th { background: rgba(255,255,255,0.03); }
+.doc-content blockquote { border-left: 3px solid var(--accent); margin: 0; padding-left: 12px; color: var(--muted); }
+@media (max-width: 900px) { .docs-layout { grid-template-columns: 1fr; } .docs-nav { position: static; max-height: none; }
+  .cl-editor-row { grid-template-columns: 1fr; } }
+
+/* ---- Accesso ---- */
+.login-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 16px; }
+.login-box { width: 100%; max-width: 360px; }
+.login-box h1 { font-size: 20px; margin: 0 0 18px; text-align: center; }
+.login-box label { display: block; margin-bottom: 12px; font-size: 13px; color: var(--muted); }
+.login-box input[type=text], .login-box input[type=password] { width: 100%; margin-top: 4px; }
+.login-box .login-remember { display: flex; gap: 8px; align-items: center; color: var(--text); }
+.login-box button { width: 100%; margin-top: 6px; }
+.login-error { color: var(--danger); font-size: 13px; margin: 0 0 12px; }
+.header-user { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); margin-left: auto; }
+
+.subsection-title { font-size: 15px; margin: 4px 0 6px; }
+
+/* ---- TV ---- */
+.tv-config, .tv-pair { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 8px; }
+.tv-config label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+.tv-config input { width: 150px; } .tv-pair input { width: 90px; }
+.tv-remote { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; max-width: 360px; margin-top: 6px; }
+.tv-remote button { padding: 10px 6px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel);
+  color: var(--text); cursor: pointer; font-size: 14px; }
+.tv-remote button:hover { border-color: var(--accent); }
+.tv-diagnosis { font-size: 12px; white-space: pre-wrap; margin: 6px 0; }
+
+/* --- Gateway Bluetooth audio --- */
+.btgw-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.btgw-bar select, .btgw-bar input { padding: 4px 6px; }
+.btgw-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.btgw-fields label { display: flex; flex-direction: column; font-size: 0.85em; gap: 3px; }
+.btgw-fields input { padding: 5px 7px; }
+.btgw-text { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 13px; line-height: 1.4;
+             padding: 8px; resize: vertical; }
+.btgw-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.btgw-yt { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.btgw-yt h4 { margin: 6px 0; }
+.btgw-list { list-style: none; padding: 0; margin: 0; max-height: 180px; overflow: auto; font-size: 0.9em; }
+.btgw-list li { padding: 2px 0; border-bottom: 1px solid var(--border, #eee); }
+.subpanel { margin: 10px 0; }
+.subpanel > summary { cursor: pointer; color: var(--muted, #888); font-size: 0.9em; padding: 4px 0; }
+@media (max-width: 640px) { .btgw-yt { grid-template-columns: 1fr; } }
+
+/* --- Tastierino numerico TV --- */
+.hidden { display: none !important; }
+.tv-accent { background: var(--accent, #2d7dd2); color: #fff; }
+.tv-back { margin-top: 10px; width: 100%; }
+.tv-keypad-display { font-family: monospace; font-size: 2em; text-align: center; letter-spacing: 6px;
+                     padding: 10px; margin-bottom: 10px; border: 1px solid var(--border, #444); border-radius: 6px; }
+.tv-keypad-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.tv-keypad-grid button { padding: 16px 0; font-size: 1.2em; }

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Display Hub — Accesso</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖥️</text></svg>">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="login-page">
+  <form class="login-box panel" method="post" action="/login">
+    <div class="panel-body">
+      <h1>🖥️ Display Hub</h1>
+      {% if error %}<p class="login-error">{{ error }}</p>{% endif %}
+      <label>Utente
+        <input name="username" type="text" autocomplete="username" autofocus required>
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <label class="login-remember">
+        <input name="remember" type="checkbox" value="1" checked> Ricordami su questo browser ({{ session_days }} giorni)
+      </label>
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="btn-primary">Accedi</button>
+    </div>
+  </form>
+</body>
+</html>

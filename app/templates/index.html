@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Display Hub — Configurazione</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖥️</text></svg>">
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js"></script>
+</head>
+<body>
+  <header>
+    <h1><a href="#/" class="brand">🖥️ Display Hub</a></h1>
+    <nav id="main-nav">
+      <a href="#/" data-view="home">🧩 Widget e display</a>
+      <a href="#/firmware" data-view="firmware">🔧 Firmware</a>
+      <a href="#/usb" data-view="usb">🔌 USB e loader</a>
+      <a href="#/configurazione" data-view="config">⚙️ Configurazione display</a>
+      <a href="#/versioni" data-view="versions">📝 Versioni</a>
+      <a href="#/documentazione" data-view="docs">📚 Documentazione</a>
+    </nav>
+    {% if auth_user %}
+    <form class="header-user" method="post" action="/logout">
+      <span>👤 {{ auth_user }}</span>
+      <button type="submit" class="btn-secondary btn-small">Esci</button>
+    </form>
+    {% endif %}
+  </header>
+
+  <main>
+    <!-- Una "pagina" per argomento (#/..., senza ricaricare: la connessione USB
+         del browser resta aperta passando da una sezione all'altra). -->
+    <div class="view view-home" data-view="home">
+      <div class="view-col">
+    <details class="panel" id="available-widgets" open>
+      <summary><span class="panel-icon">🧩</span><span class="panel-title">Widget disponibili</span></summary>
+      <div class="panel-body">
+        <p class="hint">Clicca "+ Aggiungi" per inserire una pagina in fondo all'elenco a destra.</p>
+        <div id="widget-catalog" class="widget-grid"></div>
+      </div>
+    </details>
+
+    <details class="panel" id="active-pages" open>
+      <summary><span class="panel-icon">📋</span><span class="panel-title">Pagine attive sul display</span></summary>
+      <div class="panel-body">
+        <p class="hint">Riordina con ▲ ▼ (o trascinando), ✎ per cambiare i parametri. L'ordine qui è l'ordine di swipe sul display. Lo stesso widget si può aggiungere più volte con parametri diversi.</p>
+        <ul id="page-list" class="page-list"></ul>
+        <button id="save-btn" class="btn-primary">Salva e invia al display</button>
+        <span id="save-feedback"></span>
+      </div>
+    </details>
+      </div>
+      <div class="view-col">
+    <details class="panel" id="tv-panel" open>
+      <summary><span class="panel-icon">📺</span><span class="panel-title">TV Hisense (VIDAA)</span></summary>
+      <div class="panel-body">
+        <div class="tv-config">
+          <label>IP <input id="tv-ip" type="text" placeholder="192.168.1.85"></label>
+          <label>MAC (accensione) <input id="tv-mac" type="text" placeholder="dc:9a:7d:..."></label>
+          <button id="tv-save" class="btn-secondary btn-small">Salva</button>
+          <button id="tv-connect" class="btn-secondary btn-small">Prova connessione</button>
+          <button id="tv-diagnose" class="btn-secondary btn-small">Diagnostica</button>
+        </div>
+        <p id="tv-status" class="hint"></p>
+        <pre id="tv-diagnosis" class="tv-diagnosis" style="display:none"></pre>
+        <div class="tv-pair">
+          <button id="tv-pair-start" class="btn-secondary btn-small">Abbina (codice sulla TV)</button>
+          <input id="tv-pair-code" name="tv-pair-code" type="text" inputmode="numeric" maxlength="6" placeholder="codice" autocomplete="one-time-code" data-lpignore="true">
+          <button id="tv-pair-confirm" class="btn-secondary btn-small">Conferma</button>
+        </div>
+        <div class="tv-remote" id="tv-remote-main">
+          <button data-power="toggle">⏻ Accendi/Spegni</button><button data-key="KEY_MUTE">🔇 Muto</button><button data-key="KEY_HOME">⌂ Home</button>
+          <button data-key="KEY_VOLUMEDOWN">🔉 −</button><button data-key="KEY_UP">▲</button><button data-key="KEY_VOLUMEUP">🔊 +</button>
+          <button data-key="KEY_LEFT">◀</button><button data-key="KEY_OK">OK</button><button data-key="KEY_RIGHT">▶</button>
+          <button data-key="KEY_RETURNS">↩ Indietro</button><button data-key="KEY_DOWN">▼</button><button data-key="KEY_MENU">☰ Menu</button>
+          <button data-key="KEY_CHANNELDOWN">CH −</button><button id="tv-open-keypad" class="tv-accent">🔢 Canale</button><button data-key="KEY_CHANNELUP">CH +</button>
+        </div>
+
+        <div class="tv-keypad hidden" id="tv-keypad">
+          <div class="tv-keypad-display" id="tv-keypad-num">—</div>
+          <div class="tv-keypad-grid">
+            <button data-num="1">1</button><button data-num="2">2</button><button data-num="3">3</button>
+            <button data-num="4">4</button><button data-num="5">5</button><button data-num="6">6</button>
+            <button data-num="7">7</button><button data-num="8">8</button><button data-num="9">9</button>
+            <button id="tv-keypad-clear">✕</button><button data-num="0">0</button><button id="tv-keypad-enter" class="tv-accent">OK</button>
+          </div>
+          <button id="tv-close-keypad" class="tv-back">↩ Torna ai comandi</button>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="wifi-devices" open>
+      <summary><span class="panel-icon">📡</span><span class="panel-title">Display</span></summary>
+      <div class="panel-body">
+        <p class="hint">I display compaiono qui da soli appena si collegano via WiFi. "Dimentica" toglie un display che non
+          esiste più (es. un vecchio Device ID); se è ancora acceso ricompare al suo prossimo collegamento.</p>
+        <ul id="device-list" class="page-list"></ul>
+      </div>
+    </details>
+
+    <details class="panel" id="btgw-panel" open>
+      <summary><span class="panel-icon">🔊</span><span class="panel-title">Gateway Bluetooth audio</span></summary>
+      <div class="panel-body">
+        <p class="hint">Configurazione dei gateway BT (ESP32 WROVER). Cassa e volume sono comandati dal server: il gateway,
+          una volta online, scarica questo file e lo applica. Il WiFi resta locale al gateway (USB o portale).</p>
+        <div class="btgw-bar">
+          <label>Gateway
+            <select id="btgw-select"></select>
+          </label>
+          <input id="btgw-new-id" type="text" placeholder="nuovo id (es. salotto)" maxlength="48">
+          <button id="btgw-new-btn" class="btn-secondary btn-small">Crea</button>
+          <button id="btgw-delete-btn" class="btn-secondary btn-small">Elimina</button>
+        </div>
+
+        <div class="btgw-fields">
+          <label>Cassa MAC <input id="btgw-speaker-mac" type="text" placeholder="00:E0:4C:C6:0A:BC"></label>
+          <label>Nome cassa <input id="btgw-speaker-name" type="text" placeholder="CHSmartBulb"></label>
+          <label>Volume <input id="btgw-volume" type="number" min="0" max="100" step="1"></label>
+          <label>Poll (s) <input id="btgw-poll" type="number" min="5" step="5"></label>
+        </div>
+
+        <details class="subpanel">
+          <summary>Storico YouTube (<span id="btgw-hist-count">0</span>) e preferiti (<span id="btgw-fav-count">0</span>)</summary>
+          <div class="btgw-yt">
+            <div>
+              <h4>Storico</h4>
+              <ul id="btgw-history" class="btgw-list"></ul>
+            </div>
+            <div>
+              <h4>Preferiti</h4>
+              <ul id="btgw-favorites" class="btgw-list"></ul>
+            </div>
+          </div>
+        </details>
+
+        <details class="subpanel">
+          <summary>Modifica diretta del file (INI)</summary>
+          <textarea id="btgw-text" class="btgw-text" spellcheck="false" rows="16"
+            placeholder="Seleziona o crea un gateway per modificarne il file..."></textarea>
+          <p class="hint">I campi qui sopra e questo testo mostrano lo stesso file. "Applica campi → testo" riporta i
+            campi nel testo; "Salva" scrive sul server il contenuto del testo.</p>
+        </details>
+
+        <div class="btgw-actions">
+          <button id="btgw-fields-to-text" class="btn-secondary btn-small">Applica campi → testo</button>
+          <button id="btgw-reload-btn" class="btn-secondary btn-small">Ricarica</button>
+          <button id="btgw-save-btn" class="btn-primary btn-small">Salva sul server</button>
+          <span id="btgw-status" class="hint"></span>
+        </div>
+      </div>
+    </details>
+      </div>
+    </div>
+
+    <div class="view" data-view="firmware">
+      <p class="view-intro">Generazione dei firmware (display, loader), archivio con le opzioni di ogni versione, flashing dal
+        browser e decodifica dei crash.</p>
+    <details class="panel" id="firmware-builder" open>
+      <summary><span class="panel-icon">🛠️</span><span class="panel-title">Genera firmware</span></summary>
+      <div class="panel-body">
+        <p class="hint">
+          Compila il firmware sul server con indirizzo del server già incorporato, pronto
+          per il flashing da browser qui sotto. Richiede che la BSP del pannello sia
+          presente in <code>firmware/lib/</code> sul server (vedi README).
+        </p>
+
+        <label>Modalità del firmware:
+          <select id="build-comm-mode-select">
+            <option value="wifi" selected>WiFi + Bluetooth (WiFi diretto, come prima)</option>
+            <option value="wifi_vpn">Completo: WiFi + VPN Tailscale + Bluetooth</option>
+            <option value="usb">USB + Bluetooth (nessun WiFi; serve il "ponte USB" qui sotto)</option>
+          </select>
+        </label>
+        <p class="hint" id="comm-mode-summary"></p>
+        <p class="hint" id="comm-mode-hint">
+          <strong>WiFi:</strong> testa la connessione nel pannello "Test connessione WiFi"
+          qui sotto (colleghi il display in USB, cerchi le reti che <em>lui</em> vede da
+          dove si trova, provi la password). Se riesce, i campi sotto si riempiono da
+          soli: il firmware li userà al primo boot, senza dipendere dalla persistenza
+          NVS tra loader e firmware definitivo (si è rivelata inaffidabile in pratica).
+          Lasciali vuoti per usare solo il captive portal automatico al primo avvio
+          (vedi PROTOCOL.md).
+        </p>
+        <div id="wifi-mode-fields">
+          <label>SSID WiFi (opzionale):
+            <input id="build-wifi-ssid-input" type="text" placeholder="Lascia vuoto per il solo captive portal">
+          </label>
+          <label>Password WiFi (opzionale):
+            <input id="build-wifi-password-input" type="password">
+          </label>
+
+          <label>Indirizzo server (raggiungibile dal display in LAN):
+            <input id="build-server-host-input" type="text" placeholder="es. 192.168.1.40">
+          </label>
+        </div>
+
+        <div id="vpn-mode-fields" style="display:none;">
+          <p class="hint">
+            <strong>VPN Tailscale:</strong> fuori casa (es. sotto l'hotspot del telefono), con la
+            VPN accesa, il display raggiunge <em>lo stesso indirizzo LAN</em> qui sopra
+            (es. 192.168.1.40) dentro il tunnel, se un tuo subnet router Tailscale pubblica
+            quella rete (es. 192.168.1.0/24, approvata nella console). A casa lo raggiunge
+            direttamente. Serve solo che le ACL permettano al display di raggiungere la subnet.
+          </p>
+          <label>Indirizzo server sulla tailnet (facoltativo, IP 100.x o nome MagicDNS):
+            <input id="build-server-host-vpn-input" type="text"
+                   placeholder="vuoto se il server LAN è in una subnet pubblicata">
+          </label>
+          <p class="hint">
+            Compilalo solo se <em>non</em> hai un subnet router per la rete del server e sul
+            server è installato Tailscale: verrà usato quando l'indirizzo LAN non è
+            raggiungibile né direttamente né tramite una subnet pubblicata.
+          </p>
+          <label>Nome del display sulla tailnet (opzionale):
+            <input id="build-vpn-hostname-input" type="text" placeholder="vuoto = identificativo display">
+          </label>
+          <label>Auth key Tailscale (opzionale):
+            <input id="build-vpn-auth-key-input" type="password" autocomplete="off"
+                   placeholder="tskey-auth-... (vuoto se già inviata dal loader o da inserire sul display)">
+          </label>
+          <label>Auth key effimera (opzionale, per le build con microSD):
+            <input id="build-vpn-auth-key-eph-input" type="password" autocomplete="off"
+                   placeholder="tskey-auth-... &quot;ephemeral&quot;: usata quando manca la microSD">
+          </label>
+          <label class="checkbox-label">
+            <input id="build-vpn-default-enabled-input" type="checkbox" checked>
+            VPN accesa al primo avvio (se non è già stata scelta sul display)
+          </label>
+          <label class="checkbox-label">
+            <input id="build-config-sd-input" type="checkbox">
+            Configurazione su microSD (nessun dato nella memoria interna)
+          </label>
+          <p class="hint" id="build-config-sd-hint" style="display:none;">
+            Reti WiFi, dispositivi Bluetooth, VPN e server stanno nel file
+            <code>displayhub.txt</code> della microSD, modificabile anche dal PC. Senza scheda il
+            display usa i valori di questa build e la copia salvata sul server, e le modifiche
+            valgono fino al riavvio; la VPN usa la auth key effimera. Si può inserire e togliere
+            la scheda a display acceso.
+          </p>
+          <p class="hint">
+            La auth key viene incorporata nel firmware: chiunque abbia il file .bin può
+            leggerla. Preferisci chiavi con scadenza breve, oppure inviala dal loader via
+            USB (pannello "Test connessione") e lascia vuoto questo campo.
+          </p>
+        </div>
+
+        <label>Identificativo display:
+          <input id="build-device-id-input" type="text" value="esp32s3-display-01">
+        </label>
+        <label>Versione firmware:
+          <input id="build-fw-version-input" type="text" value="{{ current_fw_version }}"
+                 placeholder="es. 2.0.0">
+        </label>
+        <label>Revisione (opzionale):
+          <input id="build-fw-revision-input" type="text" value="{{ current_fw_revision }}"
+                 placeholder="es. r1, hotfix1 — lascia vuoto se non serve">
+        </label>
+        <p id="build-version-source" class="hint"></p>
+        <p class="hint">
+          Il file generato si chiamerà <code>&lt;wifi|wifi_vpn|usb&gt;-&lt;data&gt;-&lt;versione&gt;[-&lt;revisione&gt;]_&lt;device_id&gt;.bin</code>.
+          Il campo Versione parte precompilato con l'ultima versione nota del
+          firmware; cambialo solo se stai generando qualcosa di diverso da quello
+          attuale.
+        </p>
+
+        <button id="start-build-btn" class="btn-primary">Genera firmware definitivo</button>
+        <button id="clear-cache-main-btn" class="btn-secondary">Pulisci cache librerie</button>
+        <button id="clear-build-log-btn" class="btn-secondary">Pulisci log a vista</button>
+        <span id="build-status-badge" class="status-badge status-unknown">Inattivo</span>
+
+        <pre id="build-log"></pre>
+        <button id="copy-build-log-btn" class="btn-secondary">Copia log</button>
+        <div class="crash-decoder" data-kind="main"></div>
+      </div>
+    </details>
+
+    <details class="panel" id="firmware-archive" open>
+      <summary><span class="panel-icon">🗂️</span><span class="panel-title">Archivio firmware</span></summary>
+      <div class="panel-body">
+        <p class="hint">Tutti i firmware generati o caricati, con le opzioni con cui sono stati costruiti. Password e chiavi non
+          vengono mai conservate: la tabella dice solo se c'erano. "Elimina" cancella anche ELF, log e dati della versione.
+          Per i firmware generati prima di questa funzione le opzioni sono ricavate dal nome del file (in corsivo).</p>
+        <div class="archive-toolbar">
+          <button id="archive-delete-selected" class="btn-secondary" disabled>Elimina selezionati</button>
+          <button id="archive-clean-logs" class="btn-secondary">Pulisci log delle build fallite</button>
+          <span id="archive-feedback" class="hint"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="firmware-table" class="data-table">
+            <thead><tr>
+              <th><input type="checkbox" id="archive-select-all" title="Seleziona tutti"></th>
+              <th>Firmware</th><th>Tipo e modalità</th><th>Dispositivo</th><th>Versione</th>
+              <th>Server</th><th>VPN</th><th>WiFi</th><th>Creato</th><th>Dim.</th><th>File</th><th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="flash-panel" open>
+      <summary><span class="panel-icon">⚡</span><span class="panel-title">Flashing firmware (via browser, Web Serial)</span></summary>
+      <div class="panel-body">
+        <p class="hint">
+          Collega il display alla porta USB di QUESTO computer (non serve che sia il ryzen_server).
+          Richiede Chrome o Edge — Firefox e Safari non supportano Web Serial.
+        </p>
+
+        <label>Firmware da flashare:
+          <select id="flash-firmware-select"></select>
+        </label>
+        <label>Carica nuovo .bin (merged, offset 0x0):
+          <input id="flash-firmware-upload" type="file" accept=".bin">
+        </label>
+
+        <div id="install-button-container"></div>
+        <p id="webserial-unsupported" class="hint" style="display:none; color: var(--danger);">
+          Questo browser non supporta Web Serial. Apri questa pagina con Chrome o Edge per flashare.
+        </p>
+      </div>
+    </details>
+    </div>
+
+    <div class="view" data-view="usb">
+      <p class="view-intro">Strumenti con il display collegato via USB a questo computer: prova del loader (WiFi, Bluetooth,
+        VPN) e ponte USB↔server per i firmware in modalità USB.</p>
+    <details class="panel" id="wifi-test-panel" open>
+      <summary><span class="panel-icon">🔌</span><span class="panel-title">Test connessione WiFi (via USB)</span></summary>
+      <div class="panel-body">
+        <p class="hint">
+          1) Genera e flasha uno dei due loader qui sotto. 2) Con il display ancora
+          collegato in USB, connettiti a lui da questa pagina. 3) Cerca le reti che
+          <em>lui</em> vede da dove si trova e prova una connessione con la password:
+          se riesce, le credenziali restano salvate sul device anche dopo aver flashato
+          sopra il firmware definitivo.
+        </p>
+        <p class="hint">
+          <strong>Leggero:</strong> nessuno schermo/touch coinvolto, build più veloce,
+          tutto pilotato da questa pagina. <strong>Con schermo (WiFi+Bluetooth):</strong>
+          stesso protocollo (questa pagina funziona identica con entrambi), ma in più
+          puoi scegliere la rete e digitare la password direttamente sul display, con
+          le Impostazioni (Rete: WiFi, Bluetooth, VPN Tailscale) — utile quando il
+          display non è comodamente raggiungibile da un PC. Con questo loader compare
+          qui sotto anche la sezione <strong>VPN</strong>: invii la auth key via USB e
+          verifichi che il display entri nella tailnet prima del firmware definitivo.
+        </p>
+
+        <button id="build-loader-btn" class="btn-secondary">Genera loader leggero</button>
+        <button id="clear-cache-loader-btn" class="btn-secondary">Pulisci cache librerie</button>
+        <button id="clear-loader-build-log-btn" class="btn-secondary">Pulisci log a vista</button>
+        <span id="loader-build-status-badge" class="status-badge status-unknown">Inattivo</span>
+        <pre id="loader-build-log"></pre>
+        <button id="copy-loader-build-log-btn" class="btn-secondary">Copia log</button>
+        <div class="crash-decoder" data-kind="loader"></div>
+
+        <hr style="border-color: var(--border); margin: 16px 0;">
+
+        <label class="checkbox-label">
+          <input id="build-loader-full-sd-input" type="checkbox">
+          Loader con configurazione su microSD (per preparare la scheda del firmware "Completo" con microSD)
+        </label>
+        <button id="build-loader-full-btn" class="btn-secondary">Genera loader con schermo (WiFi+Bluetooth+VPN)</button>
+        <button id="clear-cache-loader-full-btn" class="btn-secondary">Pulisci cache librerie</button>
+        <button id="clear-loader-full-build-log-btn" class="btn-secondary">Pulisci log a vista</button>
+        <span id="loader-full-build-status-badge" class="status-badge status-unknown">Inattivo</span>
+        <pre id="loader-full-build-log"></pre>
+        <button id="copy-loader-full-build-log-btn" class="btn-secondary">Copia log</button>
+        <div class="crash-decoder" data-kind="loader_full"></div>
+
+        <hr style="border-color: var(--border); margin: 16px 0;">
+
+        <h3 class="subsection-title">Gateway Bluetooth (ESP32 classico)</h3>
+        <p class="hint">
+          Firmware per un <strong>ESP32 classico</strong> (es. ESP32 DevKit / WROOM-32, non S3): fa da ponte verso una cassa
+          Bluetooth (A2DP) e riceve i comandi via WiFi dal display. Dopo il flashing: pannello "USB e loader" per
+          collegarlo al WiFi, poi ricerca e connessione della cassa. Vedi Documentazione → Gateway Bluetooth.
+        </p>
+        <p class="hint">
+          <label>Nome del gateway
+            <input id="gateway-name-input" type="text" maxlength="24" placeholder="DH-Gateway (predefinito)" style="width:16em">
+          </label>
+          Compare nelle Impostazioni del display (Gateway Bluetooth) ed e' il nome Bluetooth/mDNS. L'id sul server ne deriva
+          ("Gateway Salotto" → <code>gateway-salotto</code>, file <code>data/BT_setting/gateway-salotto.ini</code>): con piu' gateway
+          scegli un nome diverso per ciascuno. Vuoto = "DH-Gateway", id <code>gateway-01</code>.
+        </p>
+        <button id="build-gateway-btn" class="btn-secondary">Genera gateway Bluetooth</button>
+        <button id="clear-cache-gateway-btn" class="btn-secondary">Pulisci cache librerie</button>
+        <button id="clear-gateway-build-log-btn" class="btn-secondary">Pulisci log a vista</button>
+        <span id="gateway-build-status-badge" class="status-badge status-unknown">Inattivo</span>
+        <pre id="gateway-build-log"></pre>
+        <button id="copy-gateway-build-log-btn" class="btn-secondary">Copia log</button>
+        <div class="crash-decoder" data-kind="gateway"></div>
+
+        <hr style="border-color: var(--border); margin: 16px 0;">
+
+        <button id="connect-serial-btn" class="btn-primary">Connetti al display (USB)</button>
+        <button id="disconnect-serial-btn" class="btn-secondary" style="display:none;">Disconnetti</button>
+        <button id="open-flash-console-btn" class="btn-secondary">Apri console flashing</button>
+        <span id="serial-status-badge" class="status-badge status-unknown">Non connesso</span>
+        <p id="serial-unsupported" class="hint" style="display:none; color: var(--danger);">
+          Questo browser non supporta Web Serial. Usa Chrome o Edge.
+        </p>
+
+        <div id="wifi-test-controls" style="display:none; margin-top: 12px;">
+          <button id="scan-wifi-btn" class="btn-secondary">Cerca reti</button>
+          <p id="wifi-scan-feedback" class="hint"></p>
+          <ul id="wifi-network-list" class="page-list"></ul>
+
+          <label>Password:
+            <input id="wifi-test-password" type="password" placeholder="Password della rete selezionata">
+          </label>
+          <button id="test-connect-btn" class="btn-primary">Prova connessione</button>
+          <p id="wifi-connect-feedback" class="hint"></p>
+
+          <div id="loader-vpn-controls" style="display:none;">
+            <hr style="border-color: var(--border); margin: 16px 0;">
+            <h3 class="subsection-title">VPN Tailscale (loader con schermo)</h3>
+            <p class="hint">
+              Chiave e nome restano salvati sul display (NVS) e il firmware "Completo" li
+              ritrova, purché il flash non cancelli la memoria. Se dopo il flash la VPN dice
+              "Manca la auth key", inseriscila dalle impostazioni sul display o nel form di build.
+              La VPN si collega solo con il WiFi connesso.
+            </p>
+            <label>Auth key:
+              <input id="loader-vpn-key-input" type="password" autocomplete="off" placeholder="tskey-auth-...">
+            </label>
+            <label>Nome sulla tailnet (opzionale):
+              <input id="loader-vpn-hostname-input" type="text" placeholder="es. displayhub-sala">
+            </label>
+            <label class="checkbox-label">
+              <input id="loader-vpn-enabled-input" type="checkbox" checked> Attiva la VPN
+            </label>
+            <button id="loader-vpn-send-btn" class="btn-primary">Invia al display</button>
+            <button id="loader-status-btn" class="btn-secondary">Aggiorna stato</button>
+            <button id="loader-vpn-copy-btn" class="btn-secondary">Copia nel form "Genera firmware"</button>
+            <button id="loader-vpn-forget-btn" class="btn-secondary">Dimentica identità</button>
+            <p id="loader-vpn-feedback" class="hint"></p>
+
+            <div id="loader-status" class="loader-status"></div>
+            <ul id="loader-vpn-peers" class="page-list"></ul>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="usb-bridge-panel" open>
+      <summary><span class="panel-icon">🌉</span><span class="panel-title">Ponte USB↔server (modalità USB)</span></summary>
+      <div class="panel-body">
+        <p class="hint">
+          Solo se hai generato il firmware definitivo con "Modalità di comunicazione: USB"
+          qui sopra. In quella modalità il display non tocca il WiFi: parla via USB con
+          <em>questa pagina</em>, che inoltra le sue richieste al server e rispedisce le
+          risposte giù per il cavo. Tieni questa scheda aperta finché il display deve
+          restare aggiornato — se la chiudi o disconnetti, il display continua a
+          funzionare ma con l'ultimo contenuto ricevuto, finché non riconnetti il ponte.
+          Utile ad es. quando il display è collegato a un PC che raggiunge il server solo
+          tramite una VPN (Tailscale), mentre il display stesso è su una rete che non ha
+          quella rotta (es. hotspot di un telefono).
+        </p>
+        <button id="connect-usb-bridge-btn" class="btn-primary">Connetti ponte USB (nuova porta)</button>
+        <button id="disconnect-usb-bridge-btn" class="btn-secondary" style="display:none;">Disconnetti ponte</button>
+        <button id="clear-usb-bridge-log-btn" class="btn-secondary">Pulisci log a vista</button>
+        <span id="usb-bridge-status-badge" class="status-badge status-unknown">Non connesso</span>
+        <p class="hint">
+          Il display che usi per il ponte deve essere una porta USB <em>diversa</em> da
+          quella eventualmente già aperta per il test WiFi qui sopra: Web Serial non
+          permette due connessioni sulla stessa porta contemporaneamente.
+        </p>
+        <pre id="usb-bridge-log"></pre>
+      </div>
+    </details>
+    </div>
+
+    <div class="view" data-view="config">
+      <p class="view-intro">Configurazione di ogni display (reti, Bluetooth, VPN, server): copia sul server, display collegato
+        via USB o file nuovo da copiare sulla microSD. Con il display via USB, anche i file della microSD.</p>
+    <details class="panel" id="devconfig-panel" open>
+      <summary><span class="panel-icon">🗂️</span><span class="panel-title">Configurazione display e microSD</span></summary>
+      <div class="panel-body">
+        <p class="hint">
+          Il file <code>displayhub.txt</code> di un display: reti WiFi (in ordine di priorità),
+          Bluetooth, VPN, server. Lo puoi modificare sulla <strong>copia del server</strong> (il display
+          la riceve al poll successivo), direttamente sul <strong>display collegato via USB</strong>
+          (loader con schermo, o firmware in modalità USB tramite il ponte), oppure preparare un
+          <strong>file nuovo</strong> da copiare sulla microSD.
+        </p>
+        <div class="devcfg-toolbar">
+          <label>Origine:
+            <select id="devcfg-source"></select>
+          </label>
+          <button id="devcfg-load-btn" class="btn-secondary">Carica</button>
+          <button id="devcfg-save-btn" class="btn-primary">Salva</button>
+          <button id="devcfg-download-btn" class="btn-secondary">Scarica displayhub.txt</button>
+          <label class="btn-secondary devcfg-file-btn">Apri file…
+            <input id="devcfg-open-input" type="file" accept=".txt,text/plain" hidden>
+          </label>
+        </div>
+        <p id="devcfg-status" class="hint"></p>
+
+        <div id="devcfg-editor" class="devcfg-editor">
+          <fieldset>
+            <legend>Server</legend>
+            <label>Indirizzo LAN <input data-ini="server.host" type="text"></label>
+            <label>Porta <input data-ini="server.port" type="number" min="1" max="65535"></label>
+            <label>Indirizzo via VPN (100.x o MagicDNS) <input data-ini="server.host_vpn" type="text"></label>
+            <label>Intervallo di polling (ms) <input data-ini="device.poll_ms" type="number" min="500"></label>
+          </fieldset>
+          <fieldset>
+            <legend>Reti WiFi <span class="hint">(la prima ha la priorità a parità di segnale)</span></legend>
+            <ul id="devcfg-wifi-list" class="page-list"></ul>
+            <div class="devcfg-row">
+              <input id="devcfg-wifi-ssid" type="text" placeholder="Nome rete (SSID)">
+              <input id="devcfg-wifi-pw" type="password" placeholder="Password" autocomplete="off">
+              <button id="devcfg-wifi-add" class="btn-secondary">Aggiungi</button>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Interruttori</legend>
+            <label class="checkbox-label"><input data-ini="net.wifi_enabled" type="checkbox"> WiFi acceso</label>
+            <label class="checkbox-label"><input data-ini="net.bt_enabled" type="checkbox"> Bluetooth acceso</label>
+            <label class="checkbox-label"><input data-ini="vpn.enabled" type="checkbox"> VPN accesa</label>
+          </fieldset>
+          <fieldset>
+            <legend>VPN Tailscale</legend>
+            <label>Nome sulla tailnet <input data-ini="vpn.hostname" type="text"></label>
+            <label>Auth key <input data-ini="vpn.auth_key" type="password" autocomplete="off"></label>
+            <label>Auth key effimera (senza microSD) <input data-ini="vpn.auth_key_ephemeral" type="password" autocomplete="off"></label>
+            <p class="hint" id="devcfg-vpn-identity"></p>
+          </fieldset>
+          <fieldset>
+            <legend>Dispositivi Bluetooth ricordati</legend>
+            <ul id="devcfg-bt-list" class="page-list"></ul>
+            <p class="hint">Si aggiungono accoppiandoli dal display (Impostazioni → Bluetooth → Aggiungi dispositivo).</p>
+          </fieldset>
+          <details>
+            <summary>Testo completo del file</summary>
+            <textarea id="devcfg-text" rows="14" spellcheck="false"></textarea>
+            <button id="devcfg-text-apply" class="btn-secondary">Applica il testo ai campi</button>
+          </details>
+          <p class="hint">Campo vuoto = valore deciso nella build del firmware.</p>
+        </div>
+
+        <div id="devcfg-sd" style="display:none;">
+          <hr style="border-color: var(--border); margin: 16px 0;">
+          <h3 class="subsection-title">microSD del display collegato via USB</h3>
+          <p id="devcfg-sd-status" class="hint"></p>
+          <div id="devcfg-sd-decision" class="devcfg-row" style="display:none;"></div>
+          <div class="devcfg-row">
+            <button id="devcfg-sd-refresh" class="btn-secondary">Aggiorna</button>
+            <button id="devcfg-sd-save" class="btn-secondary">Salva ora</button>
+            <button id="devcfg-sd-eject" class="btn-secondary">Espelli</button>
+          </div>
+          <div id="devcfg-sd-files" style="display:none;">
+            <div class="devcfg-row">
+              <strong id="devcfg-sd-path">/</strong>
+              <button id="devcfg-sd-up" class="btn-secondary">⬆ Su</button>
+              <button id="devcfg-sd-mkdir" class="btn-secondary">Nuova cartella</button>
+              <label class="btn-secondary devcfg-file-btn">Carica file…
+                <input id="devcfg-sd-upload" type="file" hidden>
+              </label>
+            </div>
+            <ul id="devcfg-sd-list" class="page-list"></ul>
+          </div>
+        </div>
+      </div>
+    </details>
+    </div>
+
+    <div class="view" data-view="versions">
+      <p class="view-intro">Registro delle versioni e revisioni del firmware. La voce più in alto è la <strong>versione
+        attuale</strong>: il form di compilazione (sezione Firmware) propone la sua versione e revisione, che restano
+        modificabili lì. Le note sono in Markdown.</p>
+      <details class="panel" id="versions-panel" open>
+        <summary><span class="panel-icon">📝</span><span class="panel-title">Versioni e revisioni</span></summary>
+        <div class="panel-body">
+          <div class="archive-toolbar">
+            <button id="cl-new-revision" class="btn-primary">+ Nuova revisione</button>
+            <button id="cl-new-version" class="btn-secondary">+ Nuova versione</button>
+            <span id="cl-feedback" class="hint"></span>
+          </div>
+          <div id="cl-editor" class="cl-editor hidden">
+            <h3 id="cl-editor-title">Nuova voce</h3>
+            <div class="cl-editor-row">
+              <label>Versione <input id="cl-version" type="text" placeholder="3.2.0"></label>
+              <label>Revisione <input id="cl-revision" type="text" placeholder="rev_8 (facoltativa)"></label>
+              <label>Data <input id="cl-date" type="date"></label>
+            </div>
+            <label>Titolo <input id="cl-title" type="text" placeholder="es. Swipe su tutta la pagina"></label>
+            <label>Note (Markdown: elenchi con "- ", **grassetto**, `codice`)
+              <textarea id="cl-notes" rows="10" placeholder="- Cosa cambia&#10;- Cosa provare"></textarea>
+            </label>
+            <div class="modal-actions">
+              <button id="cl-cancel" class="btn-secondary">Annulla</button>
+              <button id="cl-save" class="btn-primary">Salva</button>
+            </div>
+          </div>
+          <div id="cl-list"></div>
+        </div>
+      </details>
+    </div>
+
+    <div class="view" data-view="docs">
+      <div class="docs-layout">
+        <aside class="docs-nav panel">
+          <div class="panel-body">
+            <div id="docs-list"></div>
+            <div id="docs-toc" class="docs-toc"></div>
+          </div>
+        </aside>
+        <article class="panel docs-article">
+          <div class="panel-body">
+            <p id="docs-meta" class="hint"></p>
+            <div id="docs-content" class="doc-content"><p class="hint">Scegli un documento a sinistra.</p></div>
+          </div>
+        </article>
+      </div>
+    </div>
+  </main>
+
+  <div id="config-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="config-modal-title"></h3>
+      <div id="config-modal-fields"></div>
+      <div class="modal-actions">
+        <button id="config-modal-cancel" class="btn-secondary">Annulla</button>
+        <button id="config-modal-confirm" class="btn-primary">Aggiungi</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/devconfig.js"></script>
+  <script src="/static/js/crashdecoder.js"></script>
+  <script src="/static/js/docs.js"></script>
+  <script src="/static/js/btgateway.js"></script>
+</body>
+</html>
