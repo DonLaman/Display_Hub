@@ -1,0 +1,1737 @@
+/*
+ * Display Hub — firmware ESP32-S3
+ *
+ * WiFi: al primo boot (o se la connessione con le credenziali salvate fallisce)
+ * il display apre un proprio Access Point ("DisplayHub-Setup-<device_id>") con
+ * un captive portal: da telefono/PC ti connetti a quella rete, il portale
+ * scansiona le reti visibili DAL DISPLAY (non dal server, non dal tuo PC) e
+ * te le presenta in un elenco. Scegli la rete, inserisci la password, il
+ * display salva le credenziali in NVS (persistenti a riavvio) e si riavvia
+ * connettendosi in modalità normale.
+ *
+ * Runtime: una volta connesso, invia {"device_id","fw_version"} a
+ * POST /api/esp/hello, poi fa polling di GET /api/esp/poll?device_id=...
+ * ogni POLL_INTERVAL_MS. La risposta contiene TUTTE le pagine attive con i
+ * dati già pronti: {"config_version": N, "pages": [{"widget_id","layout_type","payload"}]}.
+ * Se config_version cambia, gli schermi vengono ricostruiti da zero.
+ *
+ * Modalità di build (scelte dalla web UI, vedi device_config.h):
+ *   - USB + BT:      COMM_MODE_USB=1, FEATURE_VPN=0 (niente WiFi, dati via ponte USB)
+ *   - WiFi + BT:     COMM_MODE_USB=0, FEATURE_VPN=0 (come prima)
+ *   - Completo:      COMM_MODE_USB=0, FEATURE_VPN=1 (WiFi + VPN Tailscale + BT)
+ * In tutte le modalità c'è una pagina Impostazioni FISSA (icona ingranaggio in
+ * alto a destra, sempre visibile sopra le pagine dei widget): Rete (WiFi, BT,
+ * VPN con interruttori e dettagli) e Informazioni. È la stessa libreria del
+ * loader (lib/dh_settings). Le pagine dei widget restano quelle a richiesta,
+ * definite dal server come prima.
+ *
+ * Server in modalità Completo: SERVER_HOST (LAN) quando la VPN è spenta o non
+ * connessa, SERVER_HOST_VPN (IP 100.x o nome MagicDNS) quando è connessa. Così
+ * sotto il WiFi di casa funziona anche a VPN spenta, e sotto l'hotspot del
+ * telefono basta accendere la VPN.
+ *
+ * NOTE: adatta pin/driver del pannello (GT911 touch, driver display) al BSP
+ * specifico del modulo ESP32-S3 480x480 acquistato (vedi firmware/lib/README.md).
+ */
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <DNSServer.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <lvgl.h>
+#include <vector>
+#include <cstring>
+
+#include "device_config.h"
+#include <math.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include "DhBle.h"
+#include "DhConfig.h"
+#include "DhConfigSerial.h"
+#include "dh_fonts.h"
+#include "DhSettings.h"
+#include "DhWifi.h"
+#include "esp_heap_caps.h"
+
+// Default per device_config.h generati prima dell'introduzione delle modalità
+// (così una vecchia configurazione compila ancora, come build "WiFi + BT").
+#ifndef FEATURE_VPN
+#define FEATURE_VPN 0
+#endif
+#ifndef SERVER_HOST_VPN
+#define SERVER_HOST_VPN ""
+#endif
+#ifndef VPN_AUTH_KEY
+#define VPN_AUTH_KEY ""
+#endif
+#ifndef VPN_HOSTNAME
+#define VPN_HOSTNAME ""
+#endif
+#ifndef VPN_DEFAULT_ENABLED
+#define VPN_DEFAULT_ENABLED 0
+#endif
+#ifndef VPN_AUTH_KEY_EPHEMERAL
+#define VPN_AUTH_KEY_EPHEMERAL ""
+#endif
+// CONFIG_STORAGE_SD 1: configurazione nel file displayhub.txt sulla microSD
+// (solo RAM quando manca, nessun dato nostro in NVS). 0: stesso file, ma nella
+// NVS come sempre. Vedi lib/dh_config.
+#ifndef CONFIG_STORAGE_SD
+#define CONFIG_STORAGE_SD 0
+#endif
+#if COMM_MODE_USB && FEATURE_VPN
+#error "FEATURE_VPN richiede la modalità WiFi (COMM_MODE_USB=0): in USB il WiFi non viene mai acceso"
+#endif
+
+#if FEATURE_VPN
+#include "DhNetClient.h"
+#include "DhVpn.h"
+#include "DhVpnSettings.h"
+static DhVpnSettingsBackend g_vpn_backend;
+#endif
+#include "esp32_4848s040_bsp.h"   // dichiara display_init()/touch_init(); l'#include (non un
+                                  // extern manuale) è ciò che fa scoprire a PlatformIO questa
+                                  // libreria in firmware/lib/ e la mette in build — senza,
+                                  // il linker fallisce con "undefined reference" anche se il
+                                  // file .cpp esiste, perché la Library Dependency Finder di
+                                  // PlatformIO segue gli #include, non naviga lib/ alla cieca.
+
+// ---------- Modello dati pagina ----------
+struct PageInfo {
+    String page_id;    // identificativo della pagina (lo stesso widget può comparire più volte)
+    String widget_id;
+    String layout_type;
+    lv_obj_t* screen = nullptr;
+    lv_obj_t* title_label = nullptr;
+    lv_obj_t* value_label = nullptr;
+    lv_obj_t* list_container = nullptr;
+    // Orologio: il server manda l'ora esatta ("epoch") e il display la fa
+    // avanzare da solo ogni secondo (i dati del widget arrivano ogni ~5 min).
+    bool is_clock = false;
+};
+
+// ---------- Modello dati dashboard (griglia 2x2, doppio tap per aprirla) ----------
+struct DashboardCell {
+    lv_obj_t* container = nullptr;
+    lv_obj_t* summary_label = nullptr;
+    int page_index = -1; // indice in `pages`, -1 = cella vuota (meno di 4 pagine nel gruppo)
+};
+
+std::vector<PageInfo> pages;
+int current_page_index = 0;
+int last_seen_config_version = -1;
+unsigned long last_poll_ms = 0;
+
+// Stato comunicazione col server (per Informazioni, schermata d'attesa e backoff)
+String g_last_server_host;           // host usato all'ultimo poll (LAN o VPN)
+String g_last_route_key;             // host + strada (diretta/VPN): se cambia, nuovo hello
+int g_last_poll_code = 0;            // ultimo codice HTTP (o errore HTTPClient, negativo)
+unsigned long g_last_poll_ok_ms = 0; // millis() dell'ultimo poll riuscito (0 = mai)
+int g_poll_failures = 0;             // poll falliti consecutivi -> intervallo più lungo
+bool g_tunnel_waiting = false;       // VPN: sessione verso il server in attivazione
+unsigned long g_tunnel_wait_start_ms = 0;
+String g_tunnel_note;                // strada verso il server, per l'UI ("" = diretta)
+unsigned long g_wifi_lost_ms = 0;    // da quando il WiFi (acceso) è disconnesso
+
+lv_obj_t* scr_wait = nullptr;        // mostrata finché il server non ha inviato pagine
+lv_obj_t* wait_label = nullptr;
+lv_obj_t* gear_btn = nullptr;        // ingranaggio fisso sul layer superiore
+lv_obj_t* g_overlay = nullptr;       // contenitore di ingranaggio + icona microSD (si nascondono insieme)
+
+std::vector<lv_obj_t*> dashboard_screens;              // uno per ogni gruppo di 4 pagine
+std::vector<std::vector<DashboardCell>> dashboard_groups;
+bool dashboard_mode = false;
+int dashboard_group_index = 0;
+int pre_dashboard_page_index = 0; // per tornare esattamente qui uscendo con doppio tap
+
+// ---------- Sorgente di tick per LVGL ----------
+// CRITICO: senza chiamate periodiche a lv_tick_inc(), l'orologio interno di
+// LVGL non avanza mai, quindi il suo timer di refresh non scatta MAI e
+// lv_timer_handler() non disegna nulla, per quanti cicli tu lo chiami — è
+// esattamente il bug che teneva lo schermo bloccato sul contenuto iniziale
+// (bianco, il default screen creato automaticamente da LVGL all'avvio).
+// Va chiamata prima di OGNI lv_timer_handler(), qui nel firmware.
+static unsigned long g_last_tick_ms = 0;
+
+static void lvgl_tick_update() {
+    unsigned long now = millis();
+    if (g_last_tick_ms == 0) g_last_tick_ms = now; // primo giro: nessun delta da conteggiare
+    uint32_t elapsed = (uint32_t)(now - g_last_tick_ms);
+    if (elapsed > 0) {
+        lv_tick_inc(elapsed);
+        g_last_tick_ms = now;
+    }
+}
+
+// Forward declaration: usate da build_screen_for_layout/rebuild_pages_from_response,
+// definite più sotto insieme al resto della logica di swipe/dashboard.
+static void touch_event_cb(lv_event_t* e);
+void rebuild_dashboard();
+void update_dashboard_cells();
+
+// ---------- Tema scuro applicato esplicitamente a ogni schermo ----------
+// Non ci affidiamo al tema di default di LVGL (il warning di build
+// "possible failure to include lv_conf.h", mai del tutto risolto, rende
+// incerto se venga applicato in modo coerente): impostiamo sfondo e colore
+// testo a mano su ogni schermo, così il contenuto è sempre visibile a
+// prescindere dal tema.
+static void apply_dark_theme(lv_obj_t* scr) {
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0); // esplicito: non fidarsi del default anche se dovrebbe già esserlo
+    lv_obj_set_style_text_color(scr, lv_color_white(), 0); // ereditato dai figli (proprietà di testo)
+    // Font con le lettere accentate, esplicito (ereditato dai figli): non si
+    // dipende dal fatto che LVGL abbia letto LV_FONT_DEFAULT da lv_conf.h.
+    lv_obj_set_style_text_font(scr, &dh_font_14, 0);
+
+    lv_color_t readback = lv_obj_get_style_bg_color(scr, LV_PART_MAIN);
+    Serial.printf("[LVGL] apply_dark_theme su scr=%p: bg letto indietro = 0x%04X (atteso 0x0000)\n",
+                  (void*)scr, lv_color_to16(readback));
+}
+
+// I contenitori (lv_obj_create) hanno un proprio sfondo bianco di default che
+// NON eredita quello scuro dello schermo (solo le proprietà di testo sono
+// ereditabili in LVGL): li rendiamo trasparenti così si vede lo sfondo nero
+// dello schermo sotto di loro.
+static void make_container_transparent(lv_obj_t* obj) {
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    // Il tema dà ai contenitori un PROPRIO colore del testo (grigio scuro nel
+    // tema chiaro), che vince sul bianco ereditato dallo schermo: le righe dei
+    // widget "risorse" e simili erano quasi invisibili. Bianco esplicito.
+    lv_obj_set_style_text_color(obj, lv_color_white(), 0);
+    // Solo da leggere: NON cliccabile. Un oggetto cliccabile riceve lui i tocchi
+    // (e non li passa allo schermo), dove vivono swipe e doppio tap: nelle pagine
+    // a più righe restavano sensibili solo le fasce in alto e in basso.
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+// ---------- Costruzione schermi in base al layout_type ----------
+
+lv_obj_t* build_big_number_screen(PageInfo& page) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    apply_dark_theme(scr);
+
+    page.title_label = lv_label_create(scr);
+    lv_obj_align(page.title_label, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_text_font(page.title_label, &dh_font_20, 0);
+
+    page.value_label = lv_label_create(scr);
+    lv_obj_align(page.value_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_font(page.value_label, &dh_font_48, 0);
+    return scr;
+}
+
+lv_obj_t* build_status_grid_screen(PageInfo& page) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    apply_dark_theme(scr);
+
+    page.list_container = lv_obj_create(scr);
+    make_container_transparent(page.list_container);
+    lv_obj_set_size(page.list_container, 420, 380);
+    lv_obj_align(page.list_container, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_flex_flow(page.list_container, LV_FLEX_FLOW_COLUMN);
+    return scr;
+}
+
+lv_obj_t* build_text_log_screen(PageInfo& page) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    apply_dark_theme(scr);
+
+    page.list_container = lv_obj_create(scr);
+    make_container_transparent(page.list_container);
+    // Testo lungo (es. note): resta scorrevole con il dito, ma inoltra i suoi
+    // eventi allo schermo (EVENT_BUBBLE), così swipe e doppio tap funzionano
+    // anche toccando il testo.
+    lv_obj_add_flag(page.list_container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(page.list_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(page.list_container, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_scroll_dir(page.list_container, LV_DIR_VER);
+    lv_obj_set_size(page.list_container, 440, 400);
+    lv_obj_align(page.list_container, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_flex_flow(page.list_container, LV_FLEX_FLOW_COLUMN);
+    return scr;
+}
+
+lv_obj_t* build_screen_for_layout(PageInfo& page, const String& layout_type) {
+    lv_obj_t* scr;
+    if (layout_type == "big_number") scr = build_big_number_screen(page);
+    else if (layout_type == "status_grid") scr = build_status_grid_screen(page);
+    else if (layout_type == "text_log") scr = build_text_log_screen(page);
+    else {
+        scr = lv_obj_create(NULL);
+        apply_dark_theme(scr);
+        page.title_label = lv_label_create(scr);
+        lv_label_set_text(page.title_label, page.widget_id.c_str());
+        lv_obj_center(page.title_label);
+    }
+    // Ogni schermo, qualunque sia il suo layout, deve reagire a swipe/doppio tap:
+    // lo agganciamo qui una sola volta invece che in ciascuna build_*_screen().
+    // user_data = -1: le pagine normali (a differenza delle celle della
+    // dashboard) non hanno una pagina "di destinazione" associata al tap.
+    lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_PRESSED, (void*)(intptr_t)-1);
+    lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_PRESSING, (void*)(intptr_t)-1);
+    lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_RELEASED, (void*)(intptr_t)-1);
+    return scr;
+}
+
+// ---------- Aggiornamento dati ----------
+
+// Numero leggibile: senza decimali inutili (22 invece di 22.00, 120.46 resta).
+static String format_number(double v) {
+    char buf[32];
+    if (fabs(v - round(v)) < 0.005) snprintf(buf, sizeof(buf), "%.0f", v);
+    else if (fabs(v * 10 - round(v * 10)) < 0.05) snprintf(buf, sizeof(buf), "%.1f", v);
+    else snprintf(buf, sizeof(buf), "%.2f", v);
+    return String(buf);
+}
+
+// ---------- Orologio locale ----------
+static long g_clock_tz_offset = 0;  // secondi da UTC, come li manda il server (ora legale compresa)
+static bool g_server_time_seen = false;  // il poll porta l'ora esatta: si usa quella
+
+// Ora esatta del server, a ogni poll. Si corregge l'orologio del display solo
+// se si è spostato di più di 2 s (niente salti inutili, niente log a ogni poll).
+static void sync_server_time(long server_time) {
+    if (server_time < 1600000000L) return;
+    g_server_time_seen = true;
+    long drift = (long)time(nullptr) - server_time;
+    if (drift > 2 || drift < -2) {
+        struct timeval tv = {(time_t)server_time, 0};
+        settimeofday(&tv, nullptr);
+        Serial.printf("[Orologio] Regolato sull'ora del server (scarto %ld s)\n", drift);
+    }
+}
+
+static const char* const kGiorni[] = {"domenica", "lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato"};
+static const char* const kMesi[] = {"gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+                                    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"};
+
+static bool clock_now(struct tm& out) {
+    time_t now = time(nullptr);
+    if (now < 1600000000) return false;  // ora non ancora ricevuta dal server
+    now += g_clock_tz_offset;
+    gmtime_r(&now, &out);
+    return true;
+}
+
+static void render_clock(PageInfo& page) {
+    struct tm t;
+    if (!clock_now(t) || !page.title_label || !page.value_label) return;
+    char value[8], title[48];
+    snprintf(value, sizeof(value), "%02d:%02d", t.tm_hour, t.tm_min);
+    snprintf(title, sizeof(title), "%s %d %s", kGiorni[t.tm_wday], t.tm_mday, kMesi[t.tm_mon]);
+    if (strcmp(lv_label_get_text(page.value_label), value) != 0) lv_label_set_text(page.value_label, value);
+    if (strcmp(lv_label_get_text(page.title_label), title) != 0) lv_label_set_text(page.title_label, title);
+}
+
+void update_big_number(PageInfo& page, JsonObject payload) {
+    // Orologio: il server manda anche "epoch" (UTC) e "tz_offset": si regola
+    // l'ora del display e da lì in poi avanza da sola (vedi clock_timer_cb).
+    if (payload["epoch"].is<long>() || payload["epoch"].is<double>()) {
+        // "epoch" arriva dalla cache del server (può avere qualche minuto): si
+        // usa solo con server vecchi che non mandano server_time nel poll.
+        if (!g_server_time_seen) {
+            struct timeval tv = {(time_t)(payload["epoch"].as<double>()), 0};
+            settimeofday(&tv, nullptr);
+        }
+        g_clock_tz_offset = payload["tz_offset"] | 0L;
+        page.is_clock = true;
+        render_clock(page);
+        return;
+    }
+    const char* title = payload["title"] | "";
+    // Dato vecchio (il server non riesce ad aggiornarlo e mostra l'ultimo
+    // valore buono): lo si dice nel titolo.
+    if (payload["stale"] | false) {
+        long age = payload["stale_seconds"] | 0L;
+        String t = String(title) + "  (dati di " + String(age < 60 ? 1 : age / 60) + " min fa)";
+        lv_label_set_text(page.title_label, t.c_str());
+    } else {
+        lv_label_set_text(page.title_label, title);
+    }
+    String value_text;
+    const char* unit = payload["unit"] | "";
+    if (payload["value"].isNull()) {
+        value_text = "--";
+    } else if (payload["value"].is<const char*>()) {
+        // Testo (es. un'ora "14:05", uno stato): così com'è. Prima veniva
+        // convertito in numero e diventava "0.00".
+        value_text = String(payload["value"].as<const char*>());
+    } else {
+        value_text = format_number(payload["value"].as<double>());
+    }
+    if (strlen(unit)) value_text += " " + String(unit);
+    lv_label_set_text(page.value_label, value_text.c_str());
+    Serial.printf("[LVGL] update_big_number: title=\"%s\" value=\"%s\"\n", title, value_text.c_str());
+}
+
+// Ogni secondo: gli orologi avanzano da soli (e la dashboard li riporta).
+static void clock_timer_cb(lv_timer_t*) {
+    bool any = false;
+    for (auto& p : pages) {
+        if (p.is_clock) {
+            render_clock(p);
+            any = true;
+        }
+    }
+    if (any) update_dashboard_cells();
+}
+
+// Righe "nome ........ valore": nome a sinistra (grigio chiaro), valore a
+// destra in bianco o nel colore indicato dal server ("color": "#RRGGBB", es.
+// verde/rosso per la variazione di un prezzo). Font a 20 per leggerle da lontano.
+static lv_color_t parse_color(const char* hex, lv_color_t fallback) {
+    if (!hex || hex[0] != '#' || strlen(hex) != 7) return fallback;
+    return lv_color_hex((uint32_t)strtoul(hex + 1, nullptr, 16));
+}
+
+void update_status_grid(PageInfo& page, JsonObject payload) {
+    lv_obj_clean(page.list_container);
+    JsonArray items = payload["items"].as<JsonArray>();
+    int n = items.size();
+    int row_h = n <= 6 ? 52 : 44;
+    for (JsonObject item : items) {
+        lv_obj_t* row = lv_obj_create(page.list_container);
+        make_container_transparent(row);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_size(row, LV_PCT(100), row_h);
+        String value_str = item["value"].is<const char*>()
+            ? String((const char*)item["value"])
+            : format_number(item["value"].as<double>());
+
+        lv_obj_t* name = lv_label_create(row);
+        lv_obj_set_style_text_font(name, &dh_font_20, 0);
+        lv_obj_set_style_text_color(name, lv_color_hex(0xC4C4CA), 0);
+        lv_label_set_text(name, item["label"] | "");
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 4, 0);
+
+        lv_obj_t* value = lv_label_create(row);
+        lv_obj_set_style_text_font(value, &dh_font_20, 0);
+        lv_obj_set_style_text_color(value, parse_color(item["color"] | "", lv_color_white()), 0);
+        lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(value, 300);
+        lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(value, value_str.c_str());
+        lv_obj_align(value, LV_ALIGN_RIGHT_MID, -4, 0);
+    }
+}
+
+void update_text_log(PageInfo& page, JsonObject payload) {
+    lv_obj_clean(page.list_container);
+    for (JsonVariant line : payload["lines"].as<JsonArray>()) {
+        lv_obj_t* label = lv_label_create(page.list_container);
+        lv_label_set_text(label, line.as<const char*>());
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(label, LV_PCT(100));
+    }
+}
+
+void render_page(PageInfo& page, JsonObject payload) {
+    if (page.layout_type == "big_number") update_big_number(page, payload);
+    else if (page.layout_type == "status_grid") update_status_grid(page, payload);
+    else if (page.layout_type == "text_log") update_text_log(page, payload);
+}
+
+// ---------- Ricostruzione completa pagine (quando cambia config_version) ----------
+
+void rebuild_pages_from_response(JsonArray pages_json) {
+    // Gli schermi delle pagine precedenti vengono eliminati DOPO aver caricato
+    // quello nuovo (non si può eliminare lo schermo attivo): prima restavano in
+    // memoria a ogni cambio di configurazione.
+    std::vector<lv_obj_t*> old_screens;
+    for (auto& p : pages) if (p.screen) old_screens.push_back(p.screen);
+    pages.clear();
+    for (JsonObject p : pages_json) {
+        PageInfo page;
+        page.page_id = p["page_id"] | "";
+        page.widget_id = p["widget_id"].as<String>();
+        page.layout_type = p["layout_type"].as<String>();
+        Serial.printf("[LVGL] Costruisco pagina widget_id=%s layout_type=%s\n",
+                      page.widget_id.c_str(), page.layout_type.c_str());
+        page.screen = build_screen_for_layout(page, page.layout_type);
+        render_page(page, p["payload"].as<JsonObject>());
+        pages.push_back(page);
+    }
+    current_page_index = 0;
+    if (DhSettings::isOpen()) {
+        // L'utente è nelle impostazioni: niente cambio schermo ora, la pagina
+        // giusta viene caricata all'uscita (show_main_screen()).
+        Serial.println("[LVGL] Pagine ricostruite con le impostazioni aperte: le mostro all'uscita.");
+    } else if (!pages.empty()) {
+        Serial.printf("[LVGL] lv_scr_load(scr=%p) per widget_id=%s\n",
+                      (void*)pages[0].screen, pages[0].widget_id.c_str());
+        lv_scr_load(pages[0].screen);
+        lv_obj_invalidate(pages[0].screen); // forza l'area intera a essere ridisegnata
+        // Forziamo più cicli di refresh QUI, sincroni, invece di aspettare il
+        // prossimo giro di loop(): con un buffer LVGL parziale (40 righe su 480)
+        // un redraw completo richiede più chiamate a lv_timer_handler() in
+        // sequenza per esaurire tutte le "chunk" di area invalidata. Nel
+        // captive portal funzionava perché lo facevamo subito dopo lv_scr_load;
+        // qui, chiamata dentro poll_server()->loop(), il prossimo giro naturale
+        // arriva comunque presto ma vogliamo escludere che basti un solo giro.
+        for (int i = 0; i < 10; i++) {
+            lvgl_tick_update();
+            lv_timer_handler();
+            delay(5);
+        }
+        Serial.println("[LVGL] 10 cicli extra di lv_timer_handler() completati dopo il caricamento.");
+        Serial.printf("[LVGL] Schermo attivo dopo lv_scr_load: %p (lv_scr_act())\n", (void*)lv_scr_act());
+    } else {
+        Serial.println("[LVGL] ATTENZIONE: nessuna pagina nella risposta del server, niente da mostrare.");
+        if (scr_wait) lv_scr_load(scr_wait);
+    }
+    for (lv_obj_t* scr : old_screens) {
+        if (scr != lv_scr_act()) lv_obj_del(scr);
+    }
+    rebuild_dashboard(); // le pagine sono cambiate: ricostruisci anche la vista a griglia
+}
+
+// ---------- Aggiornamento dati sugli schermi già costruiti (config invariata) ----------
+
+// Stesso config_version: stesse pagine, stesso ordine. Si abbina per
+// page_id (server nuovi) oppure per posizione; MAI solo per widget_id: con due
+// pagine dello stesso widget (es. due prezzi crypto) si aggiornava sempre la prima.
+void update_pages_from_response(JsonArray pages_json) {
+    size_t i = 0;
+    for (JsonObject p : pages_json) {
+        const char* pid = p["page_id"] | "";
+        PageInfo* target = nullptr;
+        if (strlen(pid)) {
+            for (auto& page : pages)
+                if (page.page_id == pid) { target = &page; break; }
+        } else if (i < pages.size() && pages[i].widget_id == p["widget_id"].as<String>()) {
+            target = &pages[i];
+        }
+        if (target) render_page(*target, p["payload"].as<JsonObject>());
+        i++;
+    }
+    update_dashboard_cells(); // stessi dati, riflessi anche nelle celle della griglia
+}
+
+// ============================================================
+// Captive portal di setup WiFi (primo boot / credenziali assenti o non valide)
+// ============================================================
+
+// ---------- Valori effettivi: configurazione sopra i valori della build ----------
+// I #define di device_config.h sono solo i valori PREDEFINITI: il file di
+// configurazione (microSD o NVS) può cambiarli. DEVICE_ID e FW_VERSION no:
+// identificano questo firmware.
+String cfg_server_host() { return DhConfig::get("server", "host", SERVER_HOST); }
+String cfg_server_host_vpn() { return DhConfig::get("server", "host_vpn", SERVER_HOST_VPN); }
+long cfg_server_port() { return DhConfig::getInt("server", "port", SERVER_PORT); }
+unsigned long cfg_poll_ms() {
+    long ms = DhConfig::getInt("device", "poll_ms", POLL_INTERVAL_MS);
+    return ms < 500 ? 500UL : (unsigned long)ms;
+}
+
+// Valori della build nel formato del file (DhConfig::Options::defaults_ini).
+std::string build_defaults_ini() {
+    dhcfg::IniDoc d;
+    d.set("server", "host", SERVER_HOST);
+    d.set("server", "port", String(SERVER_PORT).c_str());
+    d.set("server", "host_vpn", SERVER_HOST_VPN);
+    d.set("device", "poll_ms", String(POLL_INTERVAL_MS).c_str());
+    if (strlen(WIFI_SSID)) d.setAll("wifi", "network", {std::string(WIFI_SSID) + " | " + WIFI_PASSWORD});
+    d.set("vpn", "enabled", VPN_DEFAULT_ENABLED ? "1" : "0");
+    if (strlen(VPN_AUTH_KEY)) d.set("vpn", "auth_key", VPN_AUTH_KEY);
+    if (strlen(VPN_AUTH_KEY_EPHEMERAL)) d.set("vpn", "auth_key_ephemeral", VPN_AUTH_KEY_EPHEMERAL);
+    d.set("vpn", "hostname", strlen(VPN_HOSTNAME) ? VPN_HOSTNAME : DEVICE_ID);
+    return d.serialize();
+}
+DNSServer dns_server;
+WebServer setup_server(80);
+const byte DNS_PORT = 53;
+
+// Rete inserita dal captive portal: in cima all'elenco (è quella appena scelta).
+void save_wifi_credentials(const String& ssid, const String& password) { DhWifi::add(ssid, password, true); }
+
+// Impostato dal captive portal quando l'utente salva una rete.
+static volatile bool g_portal_saved = false;
+static String g_portal_ssid, g_portal_password;
+
+String html_escape(const String& s) {
+    String out = s;
+    out.replace("&", "&amp;");
+    out.replace("\"", "&quot;");
+    out.replace("<", "&lt;");
+    out.replace(">", "&gt;");
+    return out;
+}
+
+void handle_portal_root() {
+    int n = WiFi.scanNetworks();
+    String options = "";
+    for (int i = 0; i < n; i++) {
+        String ssid = html_escape(WiFi.SSID(i));
+        options += "<option value=\"" + ssid + "\">" + ssid +
+                   " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+    }
+
+    String page =
+        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Display Hub - Setup WiFi</title>"
+        "<style>body{font-family:sans-serif;max-width:400px;margin:40px auto;padding:0 16px;}"
+        "input,select,button{width:100%;padding:10px;margin:6px 0;box-sizing:border-box;}"
+        "button{background:#5b8def;color:white;border:none;border-radius:6px;}</style>"
+        "</head><body>"
+        "<h2>Configura la rete WiFi</h2>"
+        "<p>Reti trovate dal display in questo punto:</p>"
+        "<form action='/save' method='POST'>"
+        "<select name='ssid'>" + options + "</select>"
+        "<input type='password' name='password' placeholder='Password WiFi'>"
+        "<button type='submit'>Connetti</button>"
+        "</form>"
+        "<p style='color:#888;font-size:12px;'>Device: " + String(DEVICE_ID) + "</p>"
+        "</body></html>";
+
+    setup_server.send(200, "text/html", page);
+}
+
+void handle_portal_save() {
+    String ssid = setup_server.arg("ssid");
+    String password = setup_server.arg("password");
+    save_wifi_credentials(ssid, password);
+
+    setup_server.send(200, "text/html",
+        "<!DOCTYPE html><html><body style='font-family:sans-serif;text-align:center;margin-top:60px;'>"
+        "<h2>Salvato</h2><p>Il display si connette alla rete scelta.</p>"
+        "</body></html>");
+
+    g_portal_ssid = ssid;
+    g_portal_password = password;
+    g_portal_saved = true;  // run_captive_portal() decide: riavvio o connessione diretta
+}
+
+// Risponde con successo a qualunque path: fa sì che i sistemi operativi
+// (Android/iOS/Windows) rilevino un captive portal e aprano la pagina da soli
+void handle_portal_not_found() {
+    setup_server.sendHeader("Location", "/", true);
+    setup_server.send(302, "text/plain", "");
+}
+
+void show_captive_portal_screen(const String& ap_name) {
+    if (g_overlay) lv_obj_add_flag(g_overlay, LV_OBJ_FLAG_HIDDEN); // qui le impostazioni non servono
+    lv_obj_t* scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+
+    lv_obj_t* title = lv_label_create(scr);
+    lv_label_set_text(title, "Configurazione WiFi");
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_style_text_font(title, &dh_font_20, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
+
+    lv_obj_t* body = lv_label_create(scr);
+    String text = "Connetti telefono o PC alla rete:\n\n" + ap_name +
+                  "\n\npoi apri:\nhttp://192.168.4.1";
+    lv_label_set_text(body, text.c_str());
+    lv_obj_set_style_text_color(body, lv_color_white(), 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(body, 400);
+    lv_obj_center(body);
+
+    lv_scr_load(scr);
+    lvgl_tick_update();
+    lv_timer_handler(); // forza subito un refresh, altrimenti si vedrebbe ancora l'ultimo schermo
+}
+
+bool connect_wifi(const String& ssid, const String& password, unsigned long timeout_ms = 15000);
+void show_main_screen();
+
+// Captive portal. Con archivio persistente (NVS o microSD in uso) dopo il
+// salvataggio il display si riavvia, come sempre. SENZA microSD (solo RAM) un
+// riavvio perderebbe la rete appena inserita: ci si connette direttamente e la
+// funzione ritorna (se la password è sbagliata il portale si riapre).
+void run_captive_portal() {
+    String ap_name = String("DisplayHub-Setup-") + DEVICE_ID;
+    static bool routes_set = false;
+    if (!routes_set) {
+        setup_server.on("/", HTTP_GET, handle_portal_root);
+        setup_server.on("/save", HTTP_POST, handle_portal_save);
+        setup_server.onNotFound(handle_portal_not_found);
+        routes_set = true;
+    }
+    for (;;) {
+        Serial.printf("[CaptivePortal] Apro access point '%s'...\n", ap_name.c_str());
+        WiFi.persistent(false);
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(ap_name.c_str());
+        Serial.printf("[CaptivePortal] AP attivo. IP: %s\n", WiFi.softAPIP().toString().c_str());
+        show_captive_portal_screen(ap_name);
+
+        dns_server.start(DNS_PORT, "*", WiFi.softAPIP()); // redirige tutti i domini a noi (captive portal)
+        setup_server.begin();
+
+        g_portal_saved = false;
+        unsigned long saved_at = 0;
+        // Dopo il salvataggio si resta vivi ancora 1,5 s: la pagina "Salvato"
+        // deve arrivare al telefono prima che l'access point sparisca.
+        while (!saved_at || millis() - saved_at < 1500) {
+            dns_server.processNextRequest();
+            setup_server.handleClient();
+            lvgl_tick_update();
+            lv_timer_handler(); // senza questo, lo schermo di sopra non verrebbe mai disegnato davvero
+            if (g_portal_saved && !saved_at) saved_at = millis();
+            delay(2);
+        }
+
+        if (DhConfig::persistent()) {
+            DhConfig::saveNow();
+            Serial.println("[CaptivePortal] Rete salvata: riavvio.");
+            delay(300);
+            ESP.restart();
+        }
+        setup_server.stop();
+        dns_server.stop();
+        WiFi.softAPdisconnect(true);
+        Serial.println("[CaptivePortal] Nessuna microSD: rete tenuta in RAM, connessione diretta (niente riavvio).");
+        if (connect_wifi(g_portal_ssid, g_portal_password)) {
+            show_main_screen();
+            return;
+        }
+        Serial.println("[CaptivePortal] Connessione non riuscita: riapro il portale.");
+    }
+}
+
+// ---------- Modalità USB: hello/poll via seriale invece che via WiFi ----------
+// Stesso protocollo JSON-per-riga del loader. Non c'è nulla dal lato display
+// che sappia "chi" sta rispondendo dall'altra parte della USB: si aspetta solo
+// una riga JSON con la stessa forma della risposta HTTP normale
+// ({"config_version":N,"pages":[...]}) . Il "ponte" (tipicamente la pagina web
+// aperta sul PC a cui il display è collegato) è responsabile di inoltrare la
+// richiesta al server vero e di rispedire indietro la risposta. Vedi
+// PROTOCOL.md, sezione "Modalità USB".
+
+// Comandi dalla web UI via USB (config_*, storage_*, file_*), in tutte le
+// modalità: vedi PROTOCOL.md, "Configurazione e microSD via USB". Ritorna
+// true se la riga era un comando (gestito qui).
+bool handle_serial_command(const String& line) {
+    if (line.indexOf("\"cmd\"") < 0) return false;
+    JsonDocument doc;
+    if (deserializeJson(doc, line)) return false;
+    return DhConfigSerial::handle(doc, Serial);
+}
+
+// Righe in arrivo fuori dall'attesa di una risposta (tutte le modalità).
+static String g_serial_line;
+void poll_serial_commands() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') {
+            if (g_serial_line.length()) handle_serial_command(g_serial_line);
+            g_serial_line = "";
+        } else if (c != '\r') {
+            g_serial_line += c;
+            if (g_serial_line.length() > 16384) g_serial_line = "";  // riga senza fine
+        }
+    }
+}
+
+bool usb_read_line_blocking(String& out, unsigned long timeout_ms) {
+    unsigned long start = millis();
+    out = "";
+    while (millis() - start < timeout_ms) {
+        while (Serial.available()) {
+            char c = Serial.read();
+            if (c == '\n') {
+                // Un comando della web UI arrivato mentre si aspetta la risposta
+                // del ponte: lo si esegue e si continua ad aspettare.
+                if (handle_serial_command(out)) {
+                    out = "";
+                    continue;
+                }
+                return out.length() > 0;
+            }
+            if (c != '\r') out += c;
+        }
+        // Pompiamo comunque LVGL durante l'attesa: senza questo, un ponte non
+        // connesso congelerebbe touch/animazioni per l'intero timeout ad ogni
+        // ciclo di poll, invece di limitarsi a saltare l'aggiornamento dati.
+        lvgl_tick_update();
+        lv_timer_handler();
+        delay(2);
+    }
+    return false;
+}
+
+void usb_send_hello() {
+    JsonDocument doc;
+    doc["type"] = "hello";
+    doc["device_id"] = DEVICE_ID;
+    doc["fw_version"] = FW_VERSION;
+    serializeJson(doc, Serial);
+    Serial.println();
+    Serial.println("[USB] hello inviato sulla seriale.");
+}
+
+void usb_poll() {
+    JsonDocument req;
+    req["cmd"] = "poll";
+    req["device_id"] = DEVICE_ID;
+    req["fw_version"] = FW_VERSION; // tenuta aggiornata anche qui: se l'hello iniziale
+                                     // fosse andato perso, il primo poll riuscito la ripristina
+    serializeJson(req, Serial);
+    Serial.println();
+
+    String line;
+    if (!usb_read_line_blocking(line, 3000)) {
+        Serial.println("[USB] poll: nessuna risposta dal ponte entro il timeout "
+                        "(la pagina web col ponte USB e' aperta e connessa?).");
+        return;
+    }
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, line);
+    if (err) {
+        Serial.println("[USB] poll: risposta non valida, ignorata.");
+        return;
+    }
+
+    g_last_poll_ok_ms = millis();
+    g_last_poll_code = 200;
+    int config_version = doc["config_version"] | -1;
+    if (doc["server_time"].is<long>()) sync_server_time(doc["server_time"].as<long>());
+    JsonArray pages_json = doc["pages"].as<JsonArray>();
+    Serial.printf("[USB] poll OK: config_version=%d, pagine=%d\n", config_version, pages_json.size());
+
+    if (config_version != last_seen_config_version) {
+        Serial.println("[LVGL] config_version cambiata: ricostruisco gli schermi.");
+        rebuild_pages_from_response(pages_json);
+        last_seen_config_version = config_version;
+    } else {
+        update_pages_from_response(pages_json);
+    }
+}
+
+// ---------- WiFi + polling HTTP (modalità normale) ----------
+
+bool connect_wifi(const String& ssid, const String& password, unsigned long timeout_ms) {
+    Serial.printf("[WiFi] Tentativo connessione a '%s'...\n", ssid.c_str());
+    WiFi.persistent(false);  // credenziali solo nella configurazione, non nella NVS del driver
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (millis() - start > timeout_ms) {
+            Serial.println("[WiFi] Timeout, connessione fallita.");
+            return false;
+        }
+        // LVGL resta vivo durante l'attesa (prima lo schermo si congelava 15 s).
+        for (int i = 0; i < 6; i++) {
+            lvgl_tick_update();
+            lv_timer_handler();
+            delay(50);
+        }
+    }
+    Serial.printf("[WiFi] Connesso. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+}
+
+// Host del server da usare ADESSO. In modalità Completo, con la VPN connessa:
+//  1. SERVER_HOST (es. 192.168.1.40) se è nella rete del WiFi attuale (a casa)
+//     oppure dentro una subnet pubblicata da un subnet router della tailnet:
+//     in quel caso DhNetClient lo raggiunge DENTRO il tunnel, anche sotto hotspot;
+//  2. altrimenti SERVER_HOST_VPN (IP 100.x o nome MagicDNS), se impostato;
+//  3. altrimenti SERVER_HOST come senza VPN.
+String current_server_host() {
+#if FEATURE_VPN
+    if (DhVpn::isConnected()) {
+        IPAddress lan;
+        String host = cfg_server_host(), host_vpn = cfg_server_host_vpn();
+        if (lan.fromString(host)) {
+            DhVpn::Path p = DhVpn::pathFor(lan, false);
+            if (p.on_lan || p.via_vpn) return host;
+        }
+        if (host_vpn.length() > 0) {
+            IPAddress ip;
+            if (ip.fromString(host_vpn)) return host_vpn;
+            String resolved = DhVpn::resolve(host_vpn);
+            if (resolved.length()) return resolved;
+            Serial.printf("[VPN] '%s' non trovato tra i dispositivi della tailnet: uso l'indirizzo LAN.\n",
+                          host_vpn.c_str());
+        }
+    }
+#endif
+    return cfg_server_host();
+}
+
+// Chiave della strada verso il server: host + diretta/VPN. Se cambia (VPN
+// connessa/persa, cambio rete, subnet pubblicata o revocata) serve un nuovo hello.
+String current_route_key() {
+    String host = current_server_host();
+#if FEATURE_VPN
+    IPAddress ip;
+    if (ip.fromString(host) && DhVpn::pathFor(ip, false).via_vpn) return host + " via VPN";
+#endif
+    return host;
+}
+
+static void setup_http(HTTPClient& http);
+
+// ---------- Sincronizzazione della configurazione col server ----------
+// Il server conserva una copia del displayhub.txt di ogni display, con una
+// revisione (vedi app/core/device_config.py). Il poll riporta "cfg_rev": se è
+// diversa da quella con cui siamo allineati ([sync] rev), o se qui la
+// configurazione è cambiata dall'ultimo allineamento (nuova rete, accoppiamento
+// BT, interruttori, microSD inserita...), si chiama POST /api/esp/config:
+//  - con le modifiche locali -> il server le unisce alle sue (tre vie) e
+//    risponde con la versione unita;
+//  - senza -> risponde con la sua versione (es. modificata dalla web UI).
+// Il display applica la risposta (replaceAll) e annota la nuova revisione.
+// Senza microSD il server fa da copia di riserva: all'avvio si scarica la
+// configurazione salvata lì invece di spingere quella della build.
+// Password e chiavi viaggiano in entrambe le direzioni (scelta esplicita).
+std::string g_cfg_synced;          // configurazione (senza [sync]) all'ultimo allineamento
+bool g_cfg_sync_known = false;     // g_cfg_synced valido
+unsigned long g_cfg_sync_retry_ms = 0;
+
+// Testo della configurazione senza la sezione [sync] (che resta del display).
+std::string cfg_sync_text() {
+    dhcfg::IniDoc d;
+    d.parse(DhConfig::serialize().c_str());
+    d.remove("sync", "rev");
+    return d.serialize();
+}
+
+// Da chiamare dopo DhConfig::begin(). Con archivio persistente la base è la
+// revisione annotata nel file e al primo poll si confronta col server (unione);
+// solo RAM: la configurazione attuale (valori della build) non è "modificata",
+// quindi al primo poll si scarica quella del server.
+void cfg_sync_init() {
+    if (DhConfig::persistent()) {
+        g_cfg_sync_known = false;
+    } else {
+        DhConfig::set("sync", "rev", "0");
+        g_cfg_synced = cfg_sync_text();
+        g_cfg_sync_known = true;
+    }
+}
+
+void cfg_sync(const String& host, uint32_t server_rev) {
+    if (g_cfg_sync_retry_ms && millis() < g_cfg_sync_retry_ms) return;
+    std::string cur = cfg_sync_text();
+    bool local_changed = !g_cfg_sync_known || cur != g_cfg_synced;
+    uint32_t base_rev = (uint32_t)DhConfig::getInt("sync", "rev", 0);
+    // Già allineati. NB: server_rev 0 = il server non ne ha ancora una copia:
+    // va creata anche se qui nulla è cambiato (copia di riserva).
+    if (!local_changed && server_rev == base_rev && server_rev != 0) return;
+    bool send_text = local_changed || server_rev == 0;     // il server non ne ha ancora una: copia di riserva
+
+    JsonDocument req;
+    req["device_id"] = DEVICE_ID;
+    req["base_rev"] = base_rev;
+    if (send_text) req["text"] = cur.c_str();
+    else req["text"] = nullptr;
+    String body;
+    serializeJson(req, body);
+    req.clear();
+
+#if FEATURE_VPN
+    DhNetClient client;
+#endif
+    HTTPClient http;
+    setup_http(http);
+    String url = String("http://") + host + ":" + String(cfg_server_port()) + "/api/esp/config";
+#if FEATURE_VPN
+    http.begin(client, url);
+#else
+    http.begin(url);
+#endif
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(body);
+    body = String();
+    if (code != 200) {
+        Serial.printf("[Config] Sincronizzazione col server non riuscita (codice %d): riprovo tra 30 s\n", code);
+        http.end();
+        g_cfg_sync_retry_ms = millis() + 30000;
+        return;
+    }
+    JsonDocument resp;
+    DeserializationError err = deserializeJson(resp, http.getStream());
+    http.end();
+    if (err) {
+        g_cfg_sync_retry_ms = millis() + 30000;
+        return;
+    }
+    g_cfg_sync_retry_ms = 0;
+    uint32_t rev = resp["rev"] | 0;
+    const char* text = resp["text"];
+    if (text) {
+        std::string server_text = text;
+        if (server_text != cur) {
+            Serial.printf("[Config] Configurazione aggiornata dal server (rev %u)\n", (unsigned)rev);
+            DhConfig::replaceAll(String(text));  // salvata subito (microSD o NVS)
+        } else if (send_text) {
+            Serial.printf("[Config] Configurazione inviata al server (rev %u)\n", (unsigned)rev);
+        }
+    }
+    DhConfig::set("sync", "rev", String(rev), true);
+    g_cfg_synced = cfg_sync_text();
+    g_cfg_sync_known = true;
+}
+
+// Timeout brevi: se il server non è raggiungibile (es. sotto hotspot con la VPN
+// spenta) ogni tentativo blocca lo schermo al massimo per questo tempo, e i
+// tentativi successivi si diradano (vedi next_poll_interval_ms()).
+static void setup_http(HTTPClient& http) {
+    http.setConnectTimeout(3000);
+    http.setTimeout(5000);
+}
+
+unsigned long next_poll_interval_ms() {
+    if (g_tunnel_waiting) return 1000;  // tunnel in attivazione: ricontrolla presto
+    if (g_poll_failures == 0) return cfg_poll_ms();
+    unsigned long ms = cfg_poll_ms() << (g_poll_failures < 3 ? g_poll_failures : 3);
+    return ms > 30000UL ? 30000UL : ms;
+}
+
+void send_hello() {
+    Serial.println("[HTTP] Invio hello al server...");
+#if FEATURE_VPN
+    DhNetClient client;  // diretto o dentro il tunnel, secondo DhVpn::pathFor
+#endif
+    HTTPClient http;
+    setup_http(http);
+    String host = current_server_host();
+    String url = String("http://") + host + ":" + String(cfg_server_port()) + "/api/esp/hello";
+#if FEATURE_VPN
+    http.begin(client, url);
+#else
+    http.begin(url);
+#endif
+    http.addHeader("Content-Type", "application/json");
+
+    JsonDocument doc;
+    doc["device_id"] = DEVICE_ID;
+    doc["fw_version"] = FW_VERSION;
+    String body;
+    serializeJson(doc, body);
+
+    int code = http.POST(body);
+    Serial.printf("[HTTP] hello -> codice risposta: %d (URL: %s)\n", code, url.c_str());
+    http.end();
+}
+
+// Quanto aspettare la sessione WireGuard verso il server prima di tentare
+// comunque la connessione (stesso comportamento di microlink_tcp_connect).
+static const unsigned long TUNNEL_WAIT_MAX_MS = 20000;
+
+void poll_server() {
+    String host = current_server_host();
+#if FEATURE_VPN
+    g_tunnel_waiting = false;
+    IPAddress host_ip;
+    DhVpn::Path path;
+    if (host_ip.fromString(host)) path = DhVpn::pathFor(host_ip, true);
+    if (path.via_vpn) {
+        // Strada dentro il tunnel (server 100.x oppure 192.168.x.x dietro un
+        // subnet router): prima di connettersi il dispositivo che trasporta il
+        // traffico deve avere una sessione WireGuard con noi. MicroLink la apre
+        // da solo solo se trova un percorso diretto; sotto hotspot (relay DERP)
+        // va svegliato esplicitamente, altrimenti la connessione fallisce.
+        g_tunnel_note = DhVpn::describe(path);
+        if (path.tunnel == DhVpn::Tunnel::Waking) {
+            if (g_tunnel_wait_start_ms == 0) {
+                g_tunnel_wait_start_ms = millis();
+                Serial.printf("[VPN] Attivazione tunnel verso %s (%s)...\n",
+                              path.peer_name.c_str(), path.peer_ip.c_str());
+            }
+            if (millis() - g_tunnel_wait_start_ms < TUNNEL_WAIT_MAX_MS) {
+                g_tunnel_waiting = true;  // riprova tra 1 s, senza contare un fallimento
+                return;
+            }
+            Serial.printf("[VPN] Tunnel verso %s non pronto dopo %lu s: provo comunque.\n",
+                          path.peer_ip.c_str(), TUNNEL_WAIT_MAX_MS / 1000);
+        } else {
+            if (path.tunnel == DhVpn::Tunnel::Up && g_tunnel_wait_start_ms != 0) {
+                Serial.printf("[VPN] Tunnel verso %s attivo dopo %lu ms.\n", path.peer_name.c_str(),
+                              millis() - g_tunnel_wait_start_ms);
+            }
+            g_tunnel_wait_start_ms = 0;
+        }
+    } else {
+        g_tunnel_note = "";
+        g_tunnel_wait_start_ms = 0;
+    }
+#endif
+    String route_key = current_route_key();
+    if (route_key != g_last_route_key) {
+        // Strada cambiata (LAN <-> VPN, subnet comparsa/sparita): il server
+        // deve sapere che ci siamo.
+        Serial.printf("[HTTP] Strada verso il server: '%s' -> '%s'\n", g_last_route_key.c_str(), route_key.c_str());
+        g_last_route_key = route_key;
+        g_last_server_host = host;
+        send_hello();
+    }
+#if FEATURE_VPN
+    DhNetClient client;
+#endif
+    HTTPClient http;
+    setup_http(http);
+    String url = String("http://") + host + ":" + String(cfg_server_port()) +
+                 "/api/esp/poll?device_id=" + DEVICE_ID + "&fw_version=" + FW_VERSION;
+#if FEATURE_VPN
+    http.begin(client, url);
+#else
+    http.begin(url);
+#endif
+    int code = http.GET();
+    g_last_poll_code = code;
+    if (code != 200) {
+        g_poll_failures++;
+        Serial.printf("[HTTP] poll fallito, codice: %d (tentativi falliti di fila: %d)\n", code, g_poll_failures);
+        http.end();
+        return;
+    }
+    g_poll_failures = 0;
+    g_last_poll_ok_ms = millis();
+
+    // Il buffer si ridimensiona da solo (ArduinoJson v7): comodo, ma tieni
+    // d'occhio l'heap se in futuro le pagine attive dovessero diventare molte.
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    http.end();
+    if (err) return;
+
+    int config_version = doc["config_version"] | -1;
+    if (doc["server_time"].is<long>()) sync_server_time(doc["server_time"].as<long>());
+    JsonArray pages_json = doc["pages"].as<JsonArray>();
+    Serial.printf("[HTTP] poll OK: config_version=%d, pagine=%d\n", config_version, pages_json.size());
+
+    if (config_version != last_seen_config_version) {
+        Serial.println("[LVGL] config_version cambiata: ricostruisco gli schermi.");
+        rebuild_pages_from_response(pages_json);
+        last_seen_config_version = config_version;
+    } else {
+        update_pages_from_response(pages_json);
+    }
+
+    // Configurazione del display (displayhub.txt) sincronizzata col server.
+    uint32_t server_cfg_rev = doc["cfg_rev"] | 0;
+    doc.clear();  // libera la memoria delle pagine prima di un'eventuale sincronizzazione
+    cfg_sync(host, server_cfg_rev);
+}
+
+// ---------- Dashboard a griglia 2x2 (doppio tap per aprirla) ----------
+// Non è un vero "thumbnail" delle pagine reali: per restare semplice e
+// affidabile, ogni cella mostra titolo/valore correnti (per i widget
+// big_number) o solo l'identificativo del widget (per status_grid/text_log,
+// il cui riassunto in una cella piccola richiederebbe più lavoro — si può
+// migliorare in seguito). Le celle si aggiornano ad ogni poll, non solo alla
+// ricostruzione, così restano vive anche mentre resti sulla dashboard.
+
+void rebuild_dashboard() {
+    for (lv_obj_t* scr : dashboard_screens) lv_obj_del(scr); // elimina anche i figli (celle/label)
+    dashboard_screens.clear();
+    dashboard_groups.clear();
+    dashboard_mode = false; // la ricostruzione invalida gli screen: non restare "dentro" a uno cancellato
+
+    int total = (int)pages.size();
+    if (total == 0) return;
+    int num_groups = (total + 3) / 4;
+
+    static const int kCellX[4] = {10, 245, 10, 245};
+    static const int kCellY[4] = {10, 10, 245, 245};
+
+    for (int g = 0; g < num_groups; g++) {
+        lv_obj_t* scr = lv_obj_create(NULL);
+        apply_dark_theme(scr);
+        lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_PRESSED, (void*)(intptr_t)-1);
+        lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_PRESSING, (void*)(intptr_t)-1);
+        lv_obj_add_event_cb(scr, touch_event_cb, LV_EVENT_RELEASED, (void*)(intptr_t)-1);
+
+        std::vector<DashboardCell> group_cells;
+        for (int slot = 0; slot < 4; slot++) {
+            int page_index = g * 4 + slot;
+            DashboardCell dc;
+            dc.container = lv_obj_create(scr);
+            lv_obj_set_pos(dc.container, kCellX[slot], kCellY[slot]);
+            lv_obj_set_size(dc.container, 225, 225);
+            lv_obj_set_style_radius(dc.container, 10, 0);
+            lv_obj_clear_flag(dc.container, LV_OBJ_FLAG_SCROLLABLE);
+
+            if (page_index < total) {
+                dc.page_index = page_index;
+                lv_obj_set_style_bg_color(dc.container, lv_color_hex(0x1c1c1c), 0);
+                lv_obj_set_style_bg_opa(dc.container, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_color(dc.container, lv_color_hex(0x444444), 0);
+                lv_obj_set_style_border_width(dc.container, 1, 0);
+
+                dc.summary_label = lv_label_create(dc.container);
+                lv_obj_set_style_text_color(dc.summary_label, lv_color_white(), 0);
+                lv_label_set_long_mode(dc.summary_label, LV_LABEL_LONG_WRAP);
+                lv_obj_set_width(dc.summary_label, 200);
+                lv_obj_set_style_text_align(dc.summary_label, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_center(dc.summary_label);
+            } else {
+                // Cella vuota (meno di 4 pagine in quest'ultimo gruppo): solo un
+                // contorno leggero, nessun tap possibile (page_index resta -1).
+                lv_obj_set_style_bg_opa(dc.container, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_color(dc.container, lv_color_hex(0x333333), 0);
+                lv_obj_set_style_border_width(dc.container, 1, 0);
+            }
+
+            // Handler agganciato anche alle celle (vuote incluse): coprono quasi
+            // tutta l'area dello schermo, quindi senza questo lo swipe per
+            // cambiare gruppo non funzionerebbe quasi mai (i tocchi finirebbero
+            // quasi sempre su una cella, non sullo sfondo dello schermo).
+            lv_obj_add_event_cb(dc.container, touch_event_cb, LV_EVENT_PRESSED,
+                                 (void*)(intptr_t)dc.page_index);
+            lv_obj_add_event_cb(dc.container, touch_event_cb, LV_EVENT_PRESSING,
+                                 (void*)(intptr_t)dc.page_index);
+            lv_obj_add_event_cb(dc.container, touch_event_cb, LV_EVENT_RELEASED,
+                                 (void*)(intptr_t)dc.page_index);
+            group_cells.push_back(dc);
+        }
+        dashboard_groups.push_back(group_cells);
+        dashboard_screens.push_back(scr);
+    }
+    update_dashboard_cells();
+}
+
+void update_dashboard_cells() {
+    for (auto& group : dashboard_groups) {
+        for (auto& cell : group) {
+            if (cell.page_index < 0 || !cell.summary_label) continue;
+            PageInfo& p = pages[cell.page_index];
+            String summary = p.widget_id;
+            if (p.layout_type == "big_number" && p.title_label && p.value_label) {
+                summary += String("\n") + lv_label_get_text(p.title_label) +
+                           "\n" + lv_label_get_text(p.value_label);
+            }
+            lv_label_set_text(cell.summary_label, summary.c_str());
+        }
+    }
+}
+
+// ---------- Swipe/tap: cambio pagina, cambio gruppo dashboard, doppio tap ----------
+// Non usiamo lv_indev_get_gesture_dir(): con la BSP di questo pannello si è
+// rivelato inaffidabile (lo swipe avanzava sempre nello stesso verso,
+// indipendentemente dalla direzione reale del dito). Calcoliamo la direzione
+// noi stessi dallo spostamento reale tra pressione e rilascio.
+
+void go_to_page(int index) {
+    if (pages.empty()) return;
+    current_page_index = (index + pages.size()) % pages.size();
+    Serial.printf("[NAV] go_to_page(%d) -> scr=%p widget_id=%s\n",
+                  current_page_index, (void*)pages[current_page_index].screen,
+                  pages[current_page_index].widget_id.c_str());
+    lv_scr_load_anim(pages[current_page_index].screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+}
+
+void go_to_dashboard_group(int index) {
+    int num_groups = (int)dashboard_screens.size();
+    if (num_groups == 0) return;
+    dashboard_group_index = (index + num_groups) % num_groups;
+    lv_scr_load_anim(dashboard_screens[dashboard_group_index], LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+}
+
+void exit_dashboard_and_go_to(int page_index) {
+    Serial.printf("[NAV] exit_dashboard_and_go_to(%d)\n", page_index);
+    dashboard_mode = false;
+    go_to_page(page_index);
+}
+
+void toggle_dashboard() {
+    if (dashboard_screens.empty()) return; // niente pagine, niente dashboard
+    if (!dashboard_mode) {
+        pre_dashboard_page_index = current_page_index;
+        dashboard_group_index = current_page_index / 4;
+        if (dashboard_group_index >= (int)dashboard_screens.size())
+            dashboard_group_index = (int)dashboard_screens.size() - 1;
+        dashboard_mode = true;
+        lv_scr_load_anim(dashboard_screens[dashboard_group_index], LV_SCR_LOAD_ANIM_FADE_ON, 150, 0, false);
+    } else {
+        dashboard_mode = false;
+        go_to_page(pre_dashboard_page_index);
+    }
+}
+
+// Un tap su una cella della dashboard non naviga subito: aspetta un breve
+// istante, perché se arriva un secondo tap in tempo utile diventa un doppio
+// tap (esce dalla dashboard senza scegliere nulla) invece di saltare comunque
+// alla pagina toccata.
+static lv_timer_t* g_tap_confirm_timer = nullptr;
+static int g_pending_nav_page_index = -1;
+
+static void tap_confirm_timer_cb(lv_timer_t* timer) {
+    if (g_pending_nav_page_index >= 0) exit_dashboard_and_go_to(g_pending_nav_page_index);
+    g_pending_nav_page_index = -1;
+    g_tap_confirm_timer = nullptr;
+}
+
+static uint32_t g_last_tap_ms = 0;
+
+void handle_tap(int cell_page_index) {
+    uint32_t now = millis();
+    bool is_double = (now - g_last_tap_ms) < 350;
+    g_last_tap_ms = is_double ? 0 : now; // azzerato dopo un doppio tap: un terzo tap ravvicinato non conta come nuovo doppio
+    Serial.printf("[TOUCH] handle_tap(cell_page_index=%d) is_double=%d dashboard_mode=%d\n",
+                  cell_page_index, (int)is_double, (int)dashboard_mode);
+
+    if (g_tap_confirm_timer) {
+        lv_timer_del(g_tap_confirm_timer);
+        g_tap_confirm_timer = nullptr;
+        g_pending_nav_page_index = -1;
+    }
+
+    if (is_double) {
+        toggle_dashboard();
+        return;
+    }
+    if (dashboard_mode && cell_page_index >= 0) {
+        g_pending_nav_page_index = cell_page_index;
+        g_tap_confirm_timer = lv_timer_create(tap_confirm_timer_cb, 350, NULL);
+        lv_timer_set_repeat_count(g_tap_confirm_timer, 1);
+    }
+    // Singolo tap su una pagina normale (non dashboard): nessuna azione definita.
+}
+
+static lv_point_t g_touch_start_point;
+static bool g_touch_tracking = false;
+static int32_t g_touch_max_dx = 0; // spostamento (con segno) di ampiezza massima osservato durante il gesto
+
+static void touch_event_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_indev_t* indev = lv_indev_get_act();
+    if (!indev) return;
+
+    if (code == LV_EVENT_PRESSED) {
+        lv_indev_get_point(indev, &g_touch_start_point);
+        g_touch_tracking = true;
+        g_touch_max_dx = 0;
+        Serial.printf("[TOUCH] PRESSED target=%p scr_act=%p dashboard_mode=%d\n",
+                      lv_event_get_target(e), (void*)lv_scr_act(), (int)dashboard_mode);
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSING) {
+        // Fira continuamente durante il trascinamento: teniamo lo spostamento
+        // più ampio visto finora, non solo il campione al rilascio. Su questo
+        // pannello un trascinamento veloce al centro dello schermo a volte
+        // produce una lettura finale poco affidabile (il controller sembra
+        // "assestarsi" più lentamente lì), mentre i campioni intermedi restano
+        // corretti — da qui lo swipe che fatica a partire proprio al centro.
+        if (g_touch_tracking) {
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+            int32_t dx = p.x - g_touch_start_point.x;
+            if (abs((int)dx) > abs((int)g_touch_max_dx)) g_touch_max_dx = dx;
+        }
+        return;
+    }
+
+    if (code != LV_EVENT_RELEASED) return;
+    if (!g_touch_tracking) {
+        Serial.println("[TOUCH] RELEASED ricevuto ma senza un PRESSED tracciato prima: ignorato.");
+        return;
+    }
+    g_touch_tracking = false;
+
+    lv_point_t end_point;
+    lv_indev_get_point(indev, &end_point);
+    int32_t dx_release = end_point.x - g_touch_start_point.x;
+    int32_t dy = end_point.y - g_touch_start_point.y;
+    // Usa lo spostamento più ampio tra quello osservato durante il
+    // trascinamento e quello al rilascio, qualunque sia maggiore in valore
+    // assoluto — copre sia gesti normali (dove i due coincidono) sia il caso
+    // problematico sopra descritto.
+    int32_t dx = (abs((int)g_touch_max_dx) > abs((int)dx_release)) ? g_touch_max_dx : dx_release;
+    // Un'UNICA soglia, senza zona morta: qualunque spostamento sopra MOVE_THRESHOLD
+    // è uno swipe; sotto, se anche l'altro asse resta piccolo, è un tap. Prima
+    // c'era un buco tra la soglia di tap e quella di swipe che poteva far
+    // ignorare del tutto un movimento reale (né tap né swipe riconosciuti).
+    const int32_t MOVE_THRESHOLD = 30;
+    Serial.printf("[TOUCH] RELEASED target=%p scr_act=%p dashboard_mode=%d dx_release=%d dx_max=%d dy=%d\n",
+                  lv_event_get_target(e), (void*)lv_scr_act(), (int)dashboard_mode,
+                  (int)dx_release, (int)g_touch_max_dx, (int)dy);
+
+    if (dx <= -MOVE_THRESHOLD) {
+        // Dito da destra verso sinistra: avanti.
+        if (dashboard_mode) go_to_dashboard_group(dashboard_group_index + 1);
+        else go_to_page(current_page_index + 1);
+    } else if (dx >= MOVE_THRESHOLD) {
+        // Dito da sinistra verso destra: indietro.
+        if (dashboard_mode) go_to_dashboard_group(dashboard_group_index - 1);
+        else go_to_page(current_page_index - 1);
+    } else if (abs((int)dy) < MOVE_THRESHOLD) {
+        int cell_page_index = (int)(intptr_t)lv_event_get_user_data(e);
+        handle_tap(cell_page_index);
+    }
+}
+
+// ---------- Impostazioni fisse, schermata d'attesa, ingranaggio ----------
+// La pagina Impostazioni è sempre raggiungibile dall'ingranaggio sul layer
+// superiore di LVGL (disegnato sopra QUALSIASI schermo: pagine, dashboard,
+// attesa), indipendentemente dalle pagine widget inviate dal server.
+
+// Torna alla vista "normale": dashboard se era aperta, altrimenti la pagina
+// corrente, oppure la schermata d'attesa se il server non ha ancora inviato pagine.
+void show_main_screen() {
+    lv_obj_t* target = scr_wait;
+    if (!pages.empty()) {
+        if (dashboard_mode && dashboard_group_index < (int)dashboard_screens.size()) {
+            target = dashboard_screens[dashboard_group_index];
+        } else {
+            if (current_page_index >= (int)pages.size()) current_page_index = 0;
+            target = pages[current_page_index].screen;
+            dashboard_mode = false;
+        }
+    }
+    lv_scr_load(target);
+    if (g_overlay) lv_obj_clear_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void gear_clicked_cb(lv_event_t* e) {
+    lv_obj_add_flag(g_overlay, LV_OBJ_FLAG_HIDDEN);
+    DhSettings::open();
+}
+
+void build_gear_button() {
+    // Contenitore trasparente e non cliccabile (i tocchi fuori dai pulsanti
+    // arrivano alle pagine sotto): [icona microSD] [ingranaggio].
+    g_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_overlay, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(g_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_overlay, 0, 0);
+    lv_obj_set_style_pad_all(g_overlay, 0, 0);
+    lv_obj_set_style_pad_column(g_overlay, 8, 0);
+    lv_obj_clear_flag(g_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(g_overlay, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(g_overlay, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(g_overlay, LV_ALIGN_TOP_RIGHT, -6, 6);
+
+    // Icona microSD (solo build con configurazione su microSD): verde in uso,
+    // gialla se serve attenzione, grigia se manca. La aggiorna DhSettings.
+    lv_obj_t* sd_icon = lv_label_create(g_overlay);
+    lv_obj_set_style_text_font(sd_icon, &dh_font_20, 0);
+    DhSettings::attachStorageIcon(sd_icon);
+
+    gear_btn = lv_btn_create(g_overlay);
+    lv_obj_set_size(gear_btn, 44, 44);
+    lv_obj_set_style_radius(gear_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(gear_btn, lv_color_hex(0x2C2C2E), 0);
+    lv_obj_set_style_bg_opa(gear_btn, LV_OPA_70, 0);
+    lv_obj_set_style_shadow_width(gear_btn, 0, 0);
+    lv_obj_t* icon = lv_label_create(gear_btn);
+    lv_label_set_text(icon, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_color(icon, lv_color_white(), 0);
+    lv_obj_center(icon);
+    lv_obj_add_event_cb(gear_btn, gear_clicked_cb, LV_EVENT_CLICKED, NULL);
+}
+
+String comm_mode_text() {
+    if (COMM_MODE_USB) return "USB + Bluetooth";
+    return FEATURE_VPN ? "Completo (WiFi + VPN + Bluetooth)" : "WiFi + Bluetooth";
+}
+
+String last_poll_text() {
+    if (g_last_poll_ok_ms == 0) {
+        return g_last_poll_code ? "mai riuscito (ultimo codice " + String(g_last_poll_code) + ")" : String("in attesa");
+    }
+    String t = String((millis() - g_last_poll_ok_ms) / 1000) + " s fa";
+    if (g_poll_failures) t += ", poi " + String(g_poll_failures) + " falliti (codice " + String(g_last_poll_code) + ")";
+    return t;
+}
+
+String info_text() {
+    String t;
+    t += "Dispositivo: " + String(DEVICE_ID) + "\n";
+    t += "Firmware: " + String(FW_VERSION) + "\n";
+    t += "Modalità: " + comm_mode_text() + "\n";
+    t += "Configurazione: " + DhConfig::statusText() + "\n";
+    if (!COMM_MODE_USB) {
+        t += "Server LAN: " + cfg_server_host() + ":" + String(cfg_server_port()) + "\n";
+#if FEATURE_VPN
+        String hv = cfg_server_host_vpn();
+        t += "Server via VPN: " + (hv.length() ? hv : String("(non impostato)")) + "\n";
+#endif
+        t += "Server in uso: " + (g_last_server_host.length() ? g_last_server_host : current_server_host()) + "\n";
+        t += "Strada: " + (g_tunnel_note.length() ? g_tunnel_note : String("diretta (WiFi)")) + "\n";
+    }
+    t += "Ultimo aggiornamento: " + last_poll_text() + "\n";
+    t += "Pagine widget: " + String(pages.size()) + "\n";
+    t += "RAM interna libera: " + String(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024) + " KB";
+    // Minimo dall'avvio: è un contatore, come la memoria libera. NON usare qui
+    // heap_caps_get_largest_free_block(): percorre tutto l'heap con gli interrupt
+    // disabilitati, e questa schermata si aggiorna ogni secondo (se l'heap è
+    // danneggiato la passata non finisce e scatta l'Interrupt WDT).
+    t += " (minimo dall'avvio " + String(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024) + " KB)\n";
+    t += "PSRAM libera: " + String(ESP.getFreePsram() / 1024) + " KB\n";
+    t += "Uptime: " + String(millis() / 1000) + " s";
+    return t;
+}
+
+void build_wait_screen() {
+    scr_wait = lv_obj_create(NULL);
+    apply_dark_theme(scr_wait);
+    lv_obj_t* title = lv_label_create(scr_wait);
+    lv_label_set_text(title, "Display Hub");
+    lv_obj_set_style_text_font(title, &dh_font_20, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
+
+    wait_label = lv_label_create(scr_wait);
+    lv_label_set_long_mode(wait_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(wait_label, 420);
+    lv_obj_set_style_text_align(wait_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(wait_label, "Avvio...");
+    lv_obj_center(wait_label);
+}
+
+void update_wait_screen() {
+    if (!wait_label || lv_scr_act() != scr_wait) return;
+    String t;
+    if (!COMM_MODE_USB && !DhSettings::wifiEnabled()) {
+        t = "WiFi disattivato.\nRiattivalo da " LV_SYMBOL_SETTINGS " > Rete.";
+    } else if (!COMM_MODE_USB && WiFi.status() != WL_CONNECTED) {
+        t = "Connessione al WiFi...";
+    } else if (COMM_MODE_USB) {
+        t = "In attesa del ponte USB\n(pagina web aperta sul PC collegato).";
+    } else {
+        t = "In attesa del server\n" + current_server_host() + ":" + String(cfg_server_port());
+        t += "\n\nUltimo tentativo: " + last_poll_text();
+#if FEATURE_VPN
+        t += "\nVPN: " + String(DhVpn::stateText());
+        if (g_tunnel_note.length()) t += " - " + g_tunnel_note;
+#endif
+    }
+    DhSettings::setLabelIfChanged(wait_label, t);
+}
+
+static void wait_timer_cb(lv_timer_t* t) { update_wait_screen(); }
+
+// "Cambia rete (portale)" dal dettaglio WiFi: stesso captive portal del primo
+// avvio. Con archivio persistente dopo il salvataggio il display si riavvia;
+// senza microSD torna qui già connesso alla rete appena aggiunta.
+void settings_reconfigure_wifi() {
+    run_captive_portal();
+    DhWifi::begin();  // senza microSD si torna qui già connessi
+}
+
+void on_settings_wifi_changed(bool on) {
+    g_wifi_lost_ms = 0;
+    if (on) g_poll_failures = 0;  // riprova subito appena connesso
+}
+
+void setup_settings() {
+    DhSettings::Config cfg;
+    cfg.wifi_available = !COMM_MODE_USB;
+    cfg.on_wifi_reconfigure = COMM_MODE_USB ? nullptr : settings_reconfigure_wifi;
+    cfg.wifi_reconfigure_label = "Cambia rete (portale)";
+    cfg.on_wifi_changed = on_settings_wifi_changed;
+#if FEATURE_VPN
+    cfg.vpn = &g_vpn_backend;
+#endif
+    cfg.info_subtitle = "Dispositivo, server, memoria";
+    cfg.info_text = info_text;
+    cfg.on_exit = show_main_screen;
+    DhSettings::begin(cfg);
+}
+
+// ---------- Setup / loop ----------
+
+void setup() {
+    // Righe lunghe dalla web UI (config_replace, blocchi di file): buffer di
+    // ricezione ampio, altrimenti mentre LVGL disegna i byte in arrivo si perdono.
+    Serial.setRxBufferSize(16384);
+    Serial.begin(115200); // log di debug via USB
+    delay(500); // dà tempo al monitor seriale di attaccarsi prima dei primi messaggi
+    Serial.println("\n\n[BOOT] Display Hub - avvio firmware definitivo");
+    Serial.printf("[BOOT] Device ID: %s, versione: %s\n", DEVICE_ID, FW_VERSION);
+    Serial.printf("[BOOT] Modalita': %s\n", comm_mode_text().c_str());
+    // Prima di qualunque uso del WiFi: il driver tiene le credenziali solo in
+    // RAM (WIFI_STORAGE_RAM) invece di copiarle nella NVS. Le reti stanno
+    // nella configurazione (DhConfig).
+    WiFi.persistent(false);
+
+    display_init();
+    touch_init();
+    // Il gesture handling è già agganciato a ogni schermo in build_screen_for_layout()
+
+    // Tema scuro nativo (come nel loader). Con il tema chiaro predefinito
+    // schede, contenitori, liste e tastiera avevano testo grigio scuro: su
+    // sfondo nero impostazioni e widget erano quasi illeggibili.
+    lv_theme_t* th = lv_theme_default_init(lv_disp_get_default(), lv_palette_main(LV_PALETTE_BLUE),
+                                           lv_palette_main(LV_PALETTE_TEAL), true, &dh_font_14);
+    lv_disp_set_theme(lv_disp_get_default(), th);
+    lv_timer_create(clock_timer_cb, 1000, NULL);
+
+    // RAM interna: le malloc() generiche oltre i 512 byte vanno in PSRAM
+    // (default del core: solo oltre 4 KB). Stringhe, JSON, configurazione,
+    // dati dei widget e della VPN non occupano più la RAM interna, che resta
+    // per WiFi, controller Bluetooth e stack dei task. Dopo display_init():
+    // le strutture del pannello restano dove il driver le ha messe. Chi ha
+    // bisogno di RAM interna (DMA, interrupt) la chiede esplicitamente.
+    heap_caps_malloc_extmem_enable(512);
+
+    // Configurazione PRIMA di tutto il resto: impostazioni, WiFi, server e VPN
+    // leggono i loro valori da qui (i #define della build sono i predefiniti).
+    {
+        std::string defaults = build_defaults_ini();
+        DhConfig::Options co;
+        co.backend = CONFIG_STORAGE_SD ? DhConfig::Backend::Sd : DhConfig::Backend::Nvs;
+        co.sd_cs = BSP_SD_CS;
+        co.sd_sck = BSP_SD_CLK;
+        co.sd_miso = BSP_SD_MISO;
+        co.sd_mosi = BSP_SD_MOSI;
+        co.device_id = DEVICE_ID;
+        co.defaults_ini = defaults.c_str();
+        DhConfig::begin(co);  // con la microSD: montaggio e lettura del file (entro ~1 s)
+        DhConfig::importLegacyNvs();  // solo archivio NVS: valori delle versioni precedenti
+        Serial.printf("[BOOT] Configurazione: %s\n", DhConfig::statusText().c_str());
+        // Subito, prima di ogni possibile connessione (anche se il WiFi verrà
+        // acceso più tardi dalle impostazioni): fissa cosa conta come "modifica
+        // locale" da inviare al server.
+        cfg_sync_init();
+    }
+
+    // Schermate fisse (attesa + impostazioni) e ingranaggio, prima di tutto il
+    // resto: sono visibili anche durante connessione WiFi e primo poll.
+    build_wait_screen();
+    setup_settings();
+    build_gear_button();
+    lv_scr_load(scr_wait);
+    lv_timer_create(wait_timer_cb, 1000, NULL);
+    update_wait_screen();
+    for (int i = 0; i < 5; i++) { lvgl_tick_update(); lv_timer_handler(); delay(5); }
+
+    DhSettings::startBtIfEnabled();  // Bluetooth disponibile in tutte le modalità
+
+    if (COMM_MODE_USB) {
+        // Nessun WiFi in questa modalità: niente credenziali, niente captive
+        // portal. Il "ponte" (tipicamente la pagina web aperta sul PC a cui il
+        // display è collegato via USB) è responsabile di tutto il resto.
+        usb_send_hello();
+        Serial.println("[BOOT] Setup completato (modalita' USB), entro nel loop principale.");
+        return;
+    }
+
+#if FEATURE_VPN
+    // Valori in [vpn] della configurazione; quelli della build sono i predefiniti
+    // (nome = VPN_HOSTNAME o DEVICE_ID). Con CONFIG_STORAGE_SD l'identità
+    // Tailscale sta nel file: senza microSD il display è un dispositivo effimero.
+    DhVpn::begin(strlen(VPN_HOSTNAME) ? VPN_HOSTNAME : DEVICE_ID, VPN_AUTH_KEY, VPN_DEFAULT_ENABLED);
+#endif
+
+    if (!DhSettings::wifiEnabled()) {
+        // Spento dall'utente nelle impostazioni: nessun tentativo, nessun captive
+        // portal. La schermata d'attesa spiega come riattivarlo.
+        Serial.println("[BOOT] WiFi disattivato dalle impostazioni: niente connessione.");
+        return;
+    }
+
+    // Reti note (configurazione, quella della build compresa): DhWifi sceglie
+    // la migliore tra quelle visibili. Attesa con lo schermo vivo: un giro con
+    // le reti visibili e uno anche con quelle non visibili (nascoste).
+    Serial.printf("[BOOT] Reti WiFi note: %d\n", (int)DhWifi::known().size());
+    DhWifi::begin();
+    while (!DhWifi::known().empty() && DhWifi::state() != DhWifi::State::Connected && DhWifi::roundsFailed() < 2) {
+        DhWifi::loop();
+        lvgl_tick_update();
+        lv_timer_handler();
+        delay(5);
+    }
+    bool connected = DhWifi::state() == DhWifi::State::Connected;
+
+    if (!connected) {
+        // Nessuna rete funzionante: captive portal. Con archivio persistente
+        // riavvia dopo il salvataggio; senza microSD ritorna già connesso.
+        Serial.println("[BOOT] Entro in modalita' captive portal (DisplayHub-Setup-...).");
+        run_captive_portal();
+        DhWifi::begin();  // senza microSD si torna qui già connessi: DhWifi riprende il controllo
+    }
+
+    g_last_server_host = current_server_host();
+    g_last_route_key = current_route_key();
+    send_hello();
+    Serial.println("[BOOT] Setup completato, entro nel loop principale.");
+}
+
+// WiFi acceso ma disconnesso: DhWifi cerca da solo la migliore rete nota
+// visibile (es. passaggio casa -> hotspot). Il captive portal solo come ultima
+// risorsa, dopo WIFI_PORTAL_AFTER_MS senza rete e due giri falliti. Nel
+// frattempo lo schermo resta utilizzabile, impostazioni comprese.
+static const unsigned long WIFI_PORTAL_AFTER_MS = 45000;
+
+// Ogni 5 minuti (e dopo l'avvio) la memoria nel log: serve a vedere sul
+// pannello quanta RAM interna resta con tutto acceso.
+static void log_memory(const char* when) {
+    Serial.printf("[MEM] %s: RAM interna libera %u KB (minimo %u KB), PSRAM libera %u KB\n", when,
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+}
+
+void loop() {
+    static unsigned long last_mem_log = 0;
+    if (millis() - last_mem_log > (last_mem_log ? 300000UL : 60000UL)) {
+        last_mem_log = millis();
+        log_memory(last_mem_log < 70000UL ? "dopo l'avvio" : "periodico");
+    }
+    lvgl_tick_update();
+    lv_timer_handler();
+    DhBle::loop();  // accoppiamenti BT nuovi/cancellati -> configurazione
+    poll_serial_commands();  // configurazione/microSD dalla web UI via USB
+
+    if (COMM_MODE_USB) {
+        unsigned long now = millis();
+        if (now - last_poll_ms >= cfg_poll_ms()) {
+            last_poll_ms = now;
+            usb_poll();
+        }
+        delay(5);
+        return;
+    }
+
+    if (!DhSettings::wifiEnabled()) {
+        g_wifi_lost_ms = 0;
+        delay(5);
+        return;
+    }
+
+    DhWifi::loop();  // riconnessione e passaggio tra le reti note (non bloccante)
+    if (WiFi.status() != WL_CONNECTED) {
+        unsigned long now = millis();
+        if (g_wifi_lost_ms == 0) g_wifi_lost_ms = now ? now : 1;
+        // Captive portal solo come ultima risorsa: nessuna rete nota raggiungibile
+        // da 45 s E almeno due giri completi falliti (visibili + nascoste).
+        if (DhWifi::disconnectedMs() > WIFI_PORTAL_AFTER_MS && DhWifi::roundsFailed() >= 2 && !DhSettings::isOpen()) {
+            Serial.println("[WiFi] Nessuna rete nota raggiungibile: apro il captive portal.");
+            run_captive_portal();  // con archivio persistente riavvia; senza microSD torna connesso
+            DhWifi::begin();
+        }
+        delay(5);
+        return;
+    }
+    if (g_wifi_lost_ms) {
+        Serial.printf("[WiFi] Riconnesso. IP: %s\n", WiFi.localIP().toString().c_str());
+        g_wifi_lost_ms = 0;
+        g_poll_failures = 0;
+        send_hello();
+    }
+
+    unsigned long now = millis();
+    bool route_changed = false;
+#if FEATURE_VPN
+    // VPN appena connessa/disconnessa: il server va raggiunto da un'altra
+    // strada, niente attesa del prossimo intervallo (né del backoff).
+    static unsigned long last_route_check_ms = 0;
+    if (now - last_route_check_ms > 500) {
+        last_route_check_ms = now;
+        route_changed = current_route_key() != g_last_route_key;
+        if (route_changed) g_poll_failures = 0;
+    }
+#endif
+    if (route_changed || now - last_poll_ms >= next_poll_interval_ms()) {
+        last_poll_ms = now;
+        poll_server();
+    }
+
+    delay(5);
+}
