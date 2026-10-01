@@ -1,0 +1,7 @@
+{
+  "name": "dh_wifi",
+  "version": "1.0.0",
+  "description": "Display Hub: più reti WiFi salvate (priorità nella configurazione), scelta della migliore visibile, passaggio automatico tra reti.",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

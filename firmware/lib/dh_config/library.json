@@ -1,0 +1,7 @@
+{
+  "name": "dh_config",
+  "version": "1.0.0",
+  "description": "Display Hub: configurazione in un file di testo sulla microSD (inseribile e rimovibile a display acceso) oppure solo in RAM. Logica in C++ puro, testata sul PC (firmware/test_host/dh_config).",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

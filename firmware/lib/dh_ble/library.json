@@ -1,0 +1,7 @@
+{
+  "name": "dh_ble",
+  "version": "1.0.0",
+  "description": "Display Hub: Bluetooth LE su NimBLE con i dispositivi accoppiati salvati nella configurazione (dh_config) invece che nella NVS.",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

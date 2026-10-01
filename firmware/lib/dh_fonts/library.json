@@ -1,0 +1,7 @@
+{
+  "name": "dh_fonts",
+  "version": "1.0.0",
+  "description": "Display Hub: Montserrat 14/20/48 con lettere accentate e punteggiatura (Latin-1, – — ’ “ ” … €) e le icone LVGL.",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

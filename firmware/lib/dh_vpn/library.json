@@ -1,0 +1,11 @@
+{
+  "name": "dh_vpn",
+  "version": "1.0.0",
+  "description": "Display Hub: gestione VPN Tailscale (MicroLink) per loader e firmware principale. Avvio/arresto in background, persistenza NVS, riaggancio al cambio rete (router/hotspot).",
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ]
+}

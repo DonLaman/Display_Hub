@@ -1,0 +1,7 @@
+{
+  "name": "dh_settings",
+  "version": "1.0.0",
+  "description": "Display Hub: pagina Impostazioni condivisa (Rete: WiFi/Bluetooth/VPN con interruttori, dettagli, input testo) per loader e firmware principale.",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}

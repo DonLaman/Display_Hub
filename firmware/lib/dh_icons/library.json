@@ -1,0 +1,1 @@
+{"name":"dh_icons","version":"1.0.0","build":{"flags":["-I src"]},"dependencies":{"lvgl":"*"}}

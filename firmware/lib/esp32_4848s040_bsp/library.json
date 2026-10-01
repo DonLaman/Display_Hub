@@ -1,0 +1,11 @@
+{
+  "name": "esp32_4848s040_bsp",
+  "version": "1.0.0",
+  "description": "BSP per il modulo ESP32-4848S040 (480x480 RGB, ST7701, GT911, SD, I2S), adattata da OraQuadraNano di SurvivalHacking/Davide Gatti",
+  "dependencies": {
+    "moononournation/GFX Library for Arduino": "1.6.0",
+    "TAMC_GT911": "https://github.com/tamctec/gt911-arduino.git"
+  },
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

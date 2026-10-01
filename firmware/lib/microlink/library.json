@@ -1,0 +1,28 @@
+{
+  "name": "microlink",
+  "version": "2.0.0-dh1",
+  "description": "MicroLink v2 (client Tailscale per ESP32) portato su PlatformIO / arduino-esp32 2.0.17 per Display Hub. Upstream: github.com/CamM2325/microlink @ 216da3300f0493b0860247d43f7af5ce29df63a5",
+  "license": "MIT",
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "flags": [
+      "-include ml_arduino_config.h",
+      "-DLOG_LOCAL_LEVEL=ESP_LOG_INFO",
+      "-Wno-unused-function",
+      "-Wno-unused-variable",
+      "-Wno-format"
+    ]
+  },
+  "dependencies": [
+    {
+      "name": "wireguard_lwip"
+    }
+  ]
+}
