@@ -1,0 +1,29 @@
+// Esempio di device_config.h per compilare a mano (senza passare dalla web UI).
+// Copia questo file in device_config.h e modifica i valori.
+//
+// COMM_MODE_USB: 0 = WiFi (default), 1 = USB seriale (vedi PROTOCOL.md).
+#define COMM_MODE_USB 0
+//
+// WIFI_SSID/WIFI_PASSWORD sono opzionali (ignorati se COMM_MODE_USB=1):
+// lasciali vuoti ("") se preferisci configurare il WiFi dal display via
+// captive portal al primo boot (rete "DisplayHub-Setup-<device_id>"). Vedi
+// PROTOCOL.md.
+#pragma once
+
+#define WIFI_SSID     ""
+#define WIFI_PASSWORD ""
+
+#define SERVER_HOST   "192.168.1.40"
+#define SERVER_PORT   12000
+
+#define DEVICE_ID     "esp32s3-display-01"
+#define FW_VERSION    "1.0.0"
+
+#define POLL_INTERVAL_MS 4000
+
+// VPN Tailscale (modalità "Completo"): vedi device_config.h.template
+#define FEATURE_VPN         0
+#define SERVER_HOST_VPN     ""
+#define VPN_AUTH_KEY        ""
+#define VPN_HOSTNAME        ""
+#define VPN_DEFAULT_ENABLED 0

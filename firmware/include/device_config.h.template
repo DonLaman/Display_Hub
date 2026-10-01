@@ -1,0 +1,66 @@
+// Generato automaticamente da core/firmware_builder.py ad ogni build lanciata
+// dalla web UI — non modificare a mano, verrà sovrascritto alla build successiva.
+// Se vuoi partire da zero senza la web UI, usa device_config.h.example come base.
+//
+// MODALITÀ DI BUILD (scelta nella web UI):
+//   "USB + BT"  -> COMM_MODE_USB 1, FEATURE_VPN 0
+//   "WiFi + BT" -> COMM_MODE_USB 0, FEATURE_VPN 0
+//   "Completo"  -> COMM_MODE_USB 0, FEATURE_VPN 1  (WiFi + VPN Tailscale + BT)
+// Il Bluetooth (BLE) è disponibile in tutte e tre; si accende/spegne dalle
+// impostazioni sul display.
+//
+// COMM_MODE_USB: 0 = comunicazione via WiFi (default), 1 = comunicazione via
+// USB seriale. In modalità USB il firmware NON tocca il WiFi per nulla (niente
+// captive portal, niente credenziali): parla lo stesso protocollo JSON-per-riga
+// del loader (hello/poll) sulla USB, e si aspetta un "ponte" dal lato server —
+// tipicamente la pagina web stessa, aperta sul PC a cui il display è collegato,
+// che inoltra le richieste al server via fetch(). Vedi PROTOCOL.md, sezione
+// "Modalità USB".
+#define COMM_MODE_USB __COMM_MODE_USB__
+//
+// WIFI_SSID/WIFI_PASSWORD sono opzionali (e ignorati in modalità USB): se
+// valorizzati (es. copiati dal test riuscito nella sezione "Test connessione
+// WiFi"), il firmware li usa al primo boot senza aver bisogno della NVS
+// scritta da un altro firmware (il loader). Se lasciati vuoti, o se il
+// tentativo con questi fallisce, il display cade comunque sul captive portal
+// come prima. Una volta connesso con successo (con questi valori o via
+// captive portal), le credenziali vengono salvate in NVS e da lì in poi si
+// riconnette da solo anche a firmware aggiornati in futuro — vedi PROTOCOL.md.
+#pragma once
+
+#define WIFI_SSID     "__WIFI_SSID__"
+#define WIFI_PASSWORD "__WIFI_PASSWORD__"
+
+#define SERVER_HOST   "__SERVER_HOST__"
+#define SERVER_PORT   __SERVER_PORT__
+
+#define DEVICE_ID     "__DEVICE_ID__"
+#define FW_VERSION    "__FW_VERSION__"
+
+#define POLL_INTERVAL_MS __POLL_INTERVAL_MS__
+
+// ---- VPN Tailscale (solo modalità "Completo") ----
+// FEATURE_VPN 0: nessun codice VPN nel firmware (MicroLink non viene linkato).
+// SERVER_HOST_VPN: facoltativo. IP 100.x del server sulla tailnet o suo nome
+//   MagicDNS, usato a VPN connessa solo se SERVER_HOST non è né nella rete locale
+//   né in una subnet pubblicata da un subnet router (in quel caso SERVER_HOST
+//   viene raggiunto dentro il tunnel con lo stesso indirizzo).
+// VPN_AUTH_KEY: opzionale (si può inserire dal loader o dalle impostazioni sul
+//   display); usata solo se il display non ne ha già una salvata.
+// VPN_HOSTNAME: nome sulla tailnet; vuoto = DEVICE_ID.
+// VPN_DEFAULT_ENABLED: stato iniziale dell'interruttore, solo se l'utente non
+//   l'ha mai cambiato (la scelta fatta sul display ha la precedenza).
+#define FEATURE_VPN         __FEATURE_VPN__
+#define SERVER_HOST_VPN     "__SERVER_HOST_VPN__"
+#define VPN_AUTH_KEY        "__VPN_AUTH_KEY__"
+#define VPN_HOSTNAME        "__VPN_HOSTNAME__"
+#define VPN_DEFAULT_ENABLED __VPN_DEFAULT_ENABLED__
+// VPN_AUTH_KEY_EPHEMERAL: facoltativa; con la configurazione su microSD si usa
+//   quando la scheda manca (dispositivo effimero). Con una sola chiave, quella.
+#define VPN_AUTH_KEY_EPHEMERAL "__VPN_AUTH_KEY_EPHEMERAL__"
+
+// ---- Configurazione su microSD (opzione della modalità Completo) ----
+// 1: configurazione nel file displayhub.txt della microSD; senza scheda solo in
+//    RAM (valori della build + copia sul server); nessun dato nostro in NVS.
+// 0: stesso file, conservato nella NVS come sempre.
+#define CONFIG_STORAGE_SD __CONFIG_STORAGE_SD__
