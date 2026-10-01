@@ -1,0 +1,43 @@
+services:
+  display-hub:
+    build: .
+    container_name: display_hub
+    restart: unless-stopped
+    ports:
+      - "12000:12000"                               # raggiungibile via VPN sull'IP host del ryzen_server
+    volumes:
+      - ./data:/app/data                             # config.json + firmware caricati/generati, persistenti
+      - ./firmware:/app/firmware                     # sorgenti firmware: qui aggiungi la BSP del pannello
+                                                       # (firmware/lib/) e qui resta la cache di build di
+                                                       # PlatformIO (.pio/) tra un riavvio e l'altro
+      - platformio_cache:/root/.platformio           # cache GLOBALE di PlatformIO (toolchain, framework,
+                                                       # piattaforme): senza questo volume, ogni `docker compose
+                                                       # up --build` ricrea il container da zero e perde questa
+                                                       # cartella, costringendo a riscaricare l'intera toolchain
+                                                       # (centinaia di MB) ad ogni singola build del firmware.
+                                                       # Diverso da ./firmware/.pio/libdeps, che è la cache delle
+                                                       # sole librerie di PROGETTO e già persiste tramite il
+                                                       # volume ./firmware qui sopra.
+      - /var/run/docker.sock:/var/run/docker.sock    # necessario solo per il widget docker_health
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DH_TIMEZONE=Europe/Rome   # fuso dell'orologio sul display (ora legale compresa)
+      # Accesso alla web UI (vedi .env.example e app/core/auth.py). Valori dal
+      # file .env accanto a questo compose, o dalle variabili dello stack in
+      # Portainer. Senza password l'accesso resta libero (con avviso nel log).
+      - DH_AUTH_USER=${DH_AUTH_USER:-admin}
+      - DH_AUTH_PASSWORD_HASH=${DH_AUTH_PASSWORD_HASH:-}
+      - DH_AUTH_PASSWORD=${DH_AUTH_PASSWORD:-}
+      - DH_SECRET_KEY=${DH_SECRET_KEY:-}
+      - DH_SESSION_DAYS=${DH_SESSION_DAYS:-30}
+      - DH_ESP_VIA_PROXY=${DH_ESP_VIA_PROXY:-0}
+    # networks:
+    #   - ryzen_shared   # decommenta e collega alla rete condivisa se i widget
+                          # (htx_bot, w-bot, acqua, waha) devono essere raggiunti per nome
+
+volumes:
+  platformio_cache:
+
+# networks:
+#   ryzen_shared:
+#     external: true

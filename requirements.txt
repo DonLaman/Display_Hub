@@ -1,0 +1,11 @@
+Flask==3.0.3
+requests==2.32.3
+psutil==6.0.0
+docker==7.1.0
+gunicorn==22.0.0
+platformio==6.1.16
+esptool==4.8.1
+tzdata==2024.2
+Markdown==3.7
+paho-mqtt==2.1.0
+vidaa-control>=1.1.0
